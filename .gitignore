@@ -1,5 +1,20 @@
 node_modules/
 dist/
 *.log
-.env
 .DS_Store
+
+# Secrets — keep API keys and tokens only in ~/.config/cursor-outpost/.env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+secrets.json
+credentials.json
+
+# Local config/state (real files live under ~/.config/cursor-outpost/)
+config.yaml
+!config.example.yaml
+*.db
+state.db
