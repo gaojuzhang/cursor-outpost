@@ -1,0 +1,12 @@
+# Copy to ~/.config/cursor-outpost/config.yaml
+projects:
+  - slug: demo
+    repo_url: https://github.com/you/repo
+    ref: main
+    default: true
+
+telegram:
+  verbose: false
+
+poller:
+  interval_ms: 8000

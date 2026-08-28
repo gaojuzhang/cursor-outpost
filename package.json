@@ -1,0 +1,27 @@
+{
+  "name": "cursor-outpost",
+  "version": "0.1.0",
+  "description": "Self-hosted companion for Cursor Cloud Agents via IM (Outpost)",
+  "type": "module",
+  "bin": {
+    "outpost": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.45.1",
+    "yaml": "^2.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
