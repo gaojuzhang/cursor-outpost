@@ -66,7 +66,36 @@ export function mapSdkAgentInfo(info: SDKAgentInfo): Agent {
   };
 }
 
+function mapSdkUsage(
+  usage: NonNullable<SdkRun["usage"]>,
+): {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+} {
+  return usage;
+}
+
+/** Map stream messages; also handles summary events not yet in SDKMessage union. */
 export function mapSdkMessage(msg: SDKMessage): StreamEvent | undefined {
+  const loose = msg as { type: string; summary?: string };
+
+  if (loose.type === "summary-started") {
+    return { type: "summary", data: { phase: "started" } };
+  }
+  if (loose.type === "summary-completed") {
+    return { type: "summary", data: { phase: "completed" } };
+  }
+  if (loose.type === "summary" && loose.summary) {
+    return {
+      type: "summary",
+      data: { phase: "done", text: loose.summary },
+    };
+  }
+
   switch (msg.type) {
     case "status":
       return {
@@ -74,6 +103,7 @@ export function mapSdkMessage(msg: SDKMessage): StreamEvent | undefined {
         data: {
           runId: msg.run_id,
           status: mapSdkRunStatus(msg.status),
+          message: msg.message,
         },
       };
     case "assistant": {
@@ -102,11 +132,12 @@ export function mapSdkMessage(msg: SDKMessage): StreamEvent | undefined {
             : undefined,
         },
       };
+    case "usage":
+      return { type: "usage", data: { usage: mapSdkUsage(msg.usage) } };
     case "system":
     case "user":
     case "request":
     case "task":
-    case "usage":
       return undefined;
     default:
       return undefined;
@@ -123,6 +154,7 @@ export function resultEventFromRun(run: SdkRun): StreamEvent {
       text: run.result,
       durationMs: run.durationMs,
       git: run.git as Run["git"],
+      usage: run.usage ? mapSdkUsage(run.usage) : undefined,
     },
   };
 }

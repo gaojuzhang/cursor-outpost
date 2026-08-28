@@ -68,4 +68,16 @@ export interface ChannelAdapter {
   beginWork?(target: OutgoingTarget, status: string): Promise<void>;
   updateWork?(target: OutgoingTarget, status: string): Promise<void>;
   endWork?(target: OutgoingTarget): Promise<void>;
+  /** Append assistant body text (may edit the last outbound message). */
+  appendAssistantContent?(
+    target: OutgoingTarget,
+    text: string,
+    opts?: SendOptions,
+  ): Promise<void>;
+  /** Replace ⏳ tail with ✅ Done + links on the last message (or morph status bubble). */
+  finalizeAssistant?(
+    target: OutgoingTarget,
+    doneTail: string,
+    opts?: SendOptions & { fullBody?: string },
+  ): Promise<void>;
 }

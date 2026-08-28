@@ -93,7 +93,11 @@ export type ListResult<T> = {
 export type ToolCallStatus = "running" | "completed";
 
 export type StreamEvent =
-  | { type: "status"; id?: string; data: { runId: string; status: RunStatus } }
+  | {
+      type: "status";
+      id?: string;
+      data: { runId: string; status: RunStatus; message?: string };
+    }
   | { type: "assistant"; id?: string; data: { text: string } }
   | { type: "thinking"; id?: string; data: { text: string } }
   | {
@@ -117,9 +121,36 @@ export type StreamEvent =
         text?: string;
         durationMs?: number;
         git?: { branches: GitBranch[] };
+        usage?: {
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadTokens: number;
+          cacheWriteTokens: number;
+          totalTokens: number;
+          reasoningTokens?: number;
+        };
       };
     }
   | { type: "error"; id?: string; data: { code: string; message: string } }
+  | {
+      type: "usage";
+      id?: string;
+      data: {
+        usage: {
+          inputTokens: number;
+          outputTokens: number;
+          cacheReadTokens: number;
+          cacheWriteTokens: number;
+          totalTokens: number;
+          reasoningTokens?: number;
+        };
+      };
+    }
+  | {
+      type: "summary";
+      id?: string;
+      data: { phase: "started" | "completed" | "done"; text?: string };
+    }
   | { type: "done"; id?: string; data: Record<string, never> }
   | { type: "heartbeat"; id?: string; data: Record<string, unknown> }
   | { type: "unknown"; id?: string; event: string; data: unknown };

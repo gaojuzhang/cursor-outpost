@@ -1,15 +1,17 @@
 import type { ChannelAdapter, OutgoingTarget } from "../channels/types.js";
 import {
   augmentWindowUserPromptWithImageNote,
-  formatWindowResult,
-  formatWindowResultHtml,
+  formatRunBodyUnavailable,
   formatWindowUserPhotoCaption,
   formatWindowUserPrompt,
   formatWindowUserPromptHtml,
+  formatAgentDeleted,
   formatWindowWorking,
+  isFailureRunStatus,
   TELEGRAM_TEXT_LIMIT,
 } from "../channels/telegram/format.js";
-import type { CursorClient } from "../cursor/client.js";
+import { assistantFollowingUserMessage } from "../core/conversation-text.js";
+import { isStaleAgentError, type CursorClient } from "../cursor/client.js";
 import {
   isTerminalRunStatus,
   type Conversation,
@@ -19,6 +21,9 @@ import {
 } from "../cursor/types.js";
 import type { Store, ThreadRow } from "../store/db.js";
 import type { ActiveStreamTracker } from "./active-streams.js";
+import { RunBodyResolver } from "../delivery/run-body-resolver.js";
+import { prUrlsFromGit } from "../delivery/run-outcome.js";
+import { TelegramRunPresenter } from "../delivery/telegram-presenter.js";
 
 export type PollerDeps = {
   store: Store;
@@ -46,15 +51,7 @@ function getFollowingAssistantText(
   conv: Conversation,
   userMsgId: string,
 ): string | undefined {
-  const msgs = conv.messages;
-  const idx = msgs.findIndex((m) => m.id === userMsgId);
-  if (idx < 0) return undefined;
-  for (let i = idx + 1; i < msgs.length; i++) {
-    const m = msgs[i]!;
-    if (m.type === "assistant_message") return (m.text ?? "").trim();
-    if (m.type === "user_message") break;
-  }
-  return undefined;
+  return assistantFollowingUserMessage(conv, userMsgId);
 }
 
 function extractPromptImages(msg: ConversationMessage): PromptImage[] {
@@ -79,6 +76,8 @@ export class Poller {
   private readonly channel: ChannelAdapter;
   private readonly streams: ActiveStreamTracker;
   private readonly intervalMs: number;
+  private readonly presenter: TelegramRunPresenter;
+  private readonly runBodyResolver: RunBodyResolver;
   private timer: ReturnType<typeof setInterval> | undefined;
   private ticking = false;
   /** In-process: already sent "Window run in progress" for this run */
@@ -90,6 +89,12 @@ export class Poller {
     this.channel = deps.channel;
     this.streams = deps.streams;
     this.intervalMs = deps.intervalMs;
+    this.presenter = new TelegramRunPresenter(this.channel);
+    this.runBodyResolver = new RunBodyResolver({
+      cursor: this.cursor,
+      getOutboundPromptText: (agentId, runId) =>
+        this.store.getOutboundPromptText(agentId, runId),
+    });
   }
 
   start(): void {
@@ -108,22 +113,31 @@ export class Poller {
     }
   }
 
-  private async workUpdate(target: OutgoingTarget, status: string): Promise<void> {
-    if (this.channel.updateWork) {
-      await this.channel.updateWork(target, status);
-    } else {
-      await this.channel.sendStatus(target, status);
-    }
-  }
-
-  private async workEnd(target: OutgoingTarget): Promise<void> {
-    if (this.channel.endWork) {
-      await this.channel.endWork(target);
-    }
-  }
-
   private errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
+  }
+
+  /** Clear binding when Cursor reports agent deleted/archived; notify once. */
+  private async maybeHandleStaleAgent(
+    thread: ThreadRow,
+    err: unknown,
+  ): Promise<boolean> {
+    if (!isStaleAgentError(err) || !thread.agent_id) return false;
+    const agentId = thread.agent_id;
+    console.log(
+      `outpost: agent ${agentId} no longer available — clearing thread binding`,
+    );
+    this.cursor.clearAgentCache(agentId);
+    this.store.clearAgentSyncState(agentId);
+    this.streams.clearAgent(agentId);
+    this.store.resetThreadAgent(thread.channel, thread.chat_id, thread.thread_id);
+    const target: OutgoingTarget = {
+      channel: thread.channel as OutgoingTarget["channel"],
+      chatId: thread.chat_id,
+      threadId: thread.thread_id,
+    };
+    await this.channel.sendText(target, formatAgentDeleted());
+    return true;
   }
 
   private async tick(): Promise<void> {
@@ -133,16 +147,22 @@ export class Poller {
       const threads = this.store.listActiveThreadsWithAgent();
       for (const thread of threads) {
         if (!thread.agent_id) continue;
+        let stale = false;
         try {
           await this.syncUserMessages(thread);
         } catch (err) {
-          console.error(
-            `outpost: poller conversation sync error agent=${thread.agent_id}: ${this.errMessage(err)}`,
-          );
+          if (await this.maybeHandleStaleAgent(thread, err)) stale = true;
+          else {
+            console.error(
+              `outpost: poller conversation sync error agent=${thread.agent_id}: ${this.errMessage(err)}`,
+            );
+          }
         }
+        if (stale) continue;
         try {
           await this.pollThread(thread);
         } catch (err) {
+          if (await this.maybeHandleStaleAgent(thread, err)) continue;
           console.error(
             `outpost: poller run poll error agent=${thread.agent_id}: ${this.errMessage(err)}`,
           );
@@ -181,7 +201,7 @@ export class Poller {
     }
 
     for (const msg of userMsgs) {
-      if (this.store.hasConversationMessage(msg.id)) continue;
+      if (this.store.hasConversationMessage(msg.id, agentId)) continue;
 
       const text = (msg.text ?? "").trim();
       const promptImages = extractPromptImages(msg);
@@ -252,22 +272,58 @@ export class Poller {
     await this.channel.sendText(target, formatWindowUserPrompt(displayText));
   }
 
-  private async sendWindowResult(
-    target: OutgoingTarget,
-    status: string,
-    result: string,
-    agentUrl: string,
-    prUrls: string[],
-  ): Promise<void> {
-    const html = formatWindowResultHtml(status, result, agentUrl, prUrls);
-    if (html.length <= TELEGRAM_TEXT_LIMIT) {
-      await this.channel.sendText(target, html, { parseMode: "HTML" });
-      return;
-    }
-    await this.channel.sendText(
-      target,
-      formatWindowResult(status, result, agentUrl, prUrls),
-    );
+  private async resolveRunSnapshot(agentId: string, run: Run): Promise<Run> {
+    if (run.result != null || !isTerminalRunStatus(run.status)) return run;
+    return this.cursor.getRun(agentId, run.id);
+  }
+
+  /** Orphan API failures (never showed Window working) — do not push to IM. */
+  private shouldAbsorbSilentRun(run: Run): boolean {
+    if (!isTerminalRunStatus(run.status)) return false;
+    if (this.announcedRunning.has(run.id)) return false;
+    return isFailureRunStatus(run.status) && !run.result?.trim();
+  }
+
+  private absorbRun(
+    agentId: string,
+    runId: string,
+    channel: string,
+    reason: string,
+  ): void {
+    this.store.insertRun({
+      runId,
+      agentId,
+      origin: "window",
+      channel,
+    });
+    this.store.markRunNotified(runId);
+    console.log(`outpost: poller absorbed run ${runId} agent=${agentId} (${reason})`);
+  }
+
+  private async resolveWindowResultText(
+    agentId: string,
+    run: Run,
+  ): Promise<string> {
+    if (run.result?.trim()) return run.result.trim();
+
+    const outcome = await this.runBodyResolver.resolve({
+      agentId,
+      runId: run.id,
+      streamBuffer: "",
+      gitHint: run.git,
+    });
+    if (outcome.bodySource === "none") return "";
+    return outcome.body.trim();
+  }
+
+  private async shouldAbsorbAfterResolve(
+    agentId: string,
+    run: Run,
+  ): Promise<boolean> {
+    if (!this.shouldAbsorbSilentRun(run)) return false;
+    const text = await this.resolveWindowResultText(agentId, run);
+    if (!text) return true;
+    return text === formatRunBodyUnavailable();
   }
 
   private async pollThread(thread: ThreadRow): Promise<void> {
@@ -293,6 +349,12 @@ export class Poller {
         continue;
       }
 
+      const full = await this.resolveRunSnapshot(agentId, run);
+      if (await this.shouldAbsorbAfterResolve(agentId, full)) {
+        this.absorbRun(agentId, run.id, thread.channel, "silent failure");
+        continue;
+      }
+
       // Unknown run → Window (or other non-bridge) origin.
       this.store.insertRun({
         runId: run.id,
@@ -314,28 +376,30 @@ export class Poller {
     if (!isTerminalRunStatus(run.status)) {
       if (!this.announcedRunning.has(run.id)) {
         this.announcedRunning.add(run.id);
-        await this.workUpdate(target, formatWindowWorking());
+        await this.presenter.updateWorkStatus(target, formatWindowWorking());
       }
       return;
     }
 
-    let full = run;
-    if (run.result == null) {
-      full = await this.cursor.getRun(thread.agent_id!, run.id);
+    const agentId = thread.agent_id!;
+    const full = await this.resolveRunSnapshot(agentId, run);
+
+    if (await this.shouldAbsorbAfterResolve(agentId, full)) {
+      this.absorbRun(agentId, run.id, thread.channel, "silent failure");
+      this.announcedRunning.delete(run.id);
+      return;
     }
 
     this.announcedRunning.delete(run.id);
-    await this.workEnd(target);
+    await this.presenter.endWork(target);
 
-    const prUrls =
-      full.git?.branches
-        ?.map((b) => b.prUrl)
-        .filter((u): u is string => Boolean(u)) ?? [];
+    const resultText = await this.resolveWindowResultText(agentId, full);
+    const prUrls = prUrlsFromGit(full.git);
 
-    await this.sendWindowResult(
+    await this.presenter.sendWindowResult(
       target,
       full.status,
-      full.result ?? "",
+      resultText,
       thread.agent_url ?? "",
       prUrls,
     );

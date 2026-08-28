@@ -12,10 +12,13 @@ import type {
 } from "../types.js";
 import {
   chunkText,
+  formatActiveTail,
   formatImageCorrupt,
   formatPhotoOnlyPrompt,
   formatPhotoUnsupported,
   formatUnsupportedImageType,
+  formatWorkStatus,
+  MESSAGE_TAIL_SEP,
   TELEGRAM_STATUS_LIMIT,
   TELEGRAM_TEXT_LIMIT,
 } from "./format.js";
@@ -36,11 +39,16 @@ export type TelegramBotOptions = {
 };
 
 type WorkSession = {
-  statusMessageId: number;
+  statusMessageId?: number;
   lastText: string;
   startedAt: number;
   typingTimer: ReturnType<typeof setInterval>;
   heartbeatTimer: ReturnType<typeof setInterval>;
+  /** Streaming assistant body (without tail). */
+  contentMessageId?: number;
+  contentBody?: string;
+  activeTail?: string;
+  parseMode?: "HTML";
 };
 
 function parseCommand(text: string): {
@@ -95,8 +103,11 @@ function chatKindFromContext(ctx: Context): ChatKind {
 /** Default (English) slash menu — used when no language-specific list matches. */
 export const TELEGRAM_BOT_COMMANDS_EN = [
   { command: "bind", description: "Bind this topic to a project: /bind <slug>" },
+  { command: "repos", description: "List Cursor-connected GitHub repos" },
   { command: "status", description: "Show session / queue status" },
   { command: "new", description: "Start a new agent mapping (does not archive cloud)" },
+  { command: "resume", description: "List or switch Cloud Agent sessions" },
+  { command: "model", description: "Show or set agent model: /model auto|<id>" },
   { command: "cancel", description: "Cancel current run and clear queue" },
   { command: "verbose", description: "Detail mode: /verbose on|off" },
   { command: "ping", description: "Connectivity check" },
@@ -105,8 +116,11 @@ export const TELEGRAM_BOT_COMMANDS_EN = [
 /** Chinese slash menu for Telegram clients with language zh*. */
 export const TELEGRAM_BOT_COMMANDS_ZH = [
   { command: "bind", description: "绑定当前 topic 到项目：/bind <slug>" },
+  { command: "repos", description: "列出 Cursor 已连接的 GitHub 仓库" },
   { command: "status", description: "查看会话 / 队列状态" },
   { command: "new", description: "新开会话映射（不 archive 云端）" },
+  { command: "resume", description: "列出或切换 Cloud Agent 会话" },
+  { command: "model", description: "查看或切换模型：/model auto|<id>" },
   { command: "cancel", description: "取消当前 run 并清空队列" },
   { command: "verbose", description: "详细模式：/verbose on|off" },
   { command: "ping", description: "连通性测试" },
@@ -220,8 +234,21 @@ export class TelegramChannel implements ChannelAdapter {
   }
 
   async beginWork(target: OutgoingTarget, status: string): Promise<void> {
-    await this.endWork(target);
+    const key = this.workKey(target);
+    const existing = this.workSessions.get(key);
     const clipped = this.clipStatus(status);
+    if (existing) {
+      if (existing.contentMessageId != null) {
+        await this.setContentTail(existing, target, clipped);
+        return;
+      }
+      if (existing.statusMessageId != null) {
+        await this.updateWork(target, clipped);
+        return;
+      }
+    }
+
+    await this.endWork(target);
     const sent = await this.bot.api.sendMessage(
       Number(target.chatId),
       clipped,
@@ -266,6 +293,11 @@ export class TelegramChannel implements ChannelAdapter {
       await this.beginWork(target, clipped);
       return;
     }
+    if (session.contentMessageId != null) {
+      await this.setContentTail(session, target, clipped);
+      return;
+    }
+    if (!session.statusMessageId) return;
     if (clipped === session.lastText) return;
 
     try {
@@ -280,23 +312,252 @@ export class TelegramChannel implements ChannelAdapter {
     }
   }
 
-  async endWork(target: OutgoingTarget): Promise<void> {
+  async appendAssistantContent(
+    target: OutgoingTarget,
+    text: string,
+    opts?: SendOptions,
+  ): Promise<void> {
+    if (!text) return;
+    const key = this.workKey(target);
+    let session = this.workSessions.get(key);
+    if (!session) {
+      await this.beginWork(target, formatWorkStatus("Working"));
+      session = this.workSessions.get(key);
+      if (!session) return;
+      session.activeTail = formatActiveTail("Working");
+    }
+
+    const tail = session.activeTail ?? formatActiveTail("Working");
+    session.activeTail = tail;
+
+    const prev = session.contentBody ?? "";
+    if (prev) {
+      if (text === prev) return;
+      if (prev.endsWith(text)) return;
+      if (text.startsWith(prev)) {
+        text = text.slice(prev.length);
+        if (!text) return;
+      }
+    }
+
+    if (session.contentMessageId == null) {
+      session.contentBody = text;
+      session.parseMode = opts?.parseMode;
+      const msgText = text + tail;
+
+      if (session.statusMessageId != null) {
+        try {
+          await this.bot.api.editMessageText(
+            Number(target.chatId),
+            session.statusMessageId,
+            msgText,
+            { parse_mode: opts?.parseMode },
+          );
+          session.contentMessageId = session.statusMessageId;
+          session.statusMessageId = undefined;
+          session.activeTail = tail;
+          return;
+        } catch {
+          await this.dismissStatusBubble(session, target);
+        }
+      }
+
+      const sent = await this.bot.api.sendMessage(
+        Number(target.chatId),
+        msgText,
+        {
+          ...this.threadSendOpts(target),
+          disable_notification: opts?.silent ?? false,
+          parse_mode: opts?.parseMode,
+        },
+      );
+      session.contentMessageId = sent.message_id;
+      return;
+    }
+
+    let body = (session.contentBody ?? "") + text;
+    const full = body + tail;
+    if (full.length <= TELEGRAM_TEXT_LIMIT) {
+      await this.bot.api.editMessageText(
+        Number(target.chatId),
+        session.contentMessageId,
+        full,
+        { parse_mode: session.parseMode },
+      );
+      session.contentBody = body;
+      return;
+    }
+
+    const maxBody = TELEGRAM_TEXT_LIMIT - tail.length;
+    const firstPart = body.slice(0, maxBody);
+    const rest = body.slice(maxBody);
+    await this.bot.api.editMessageText(
+      Number(target.chatId),
+      session.contentMessageId,
+      firstPart + tail,
+      { parse_mode: session.parseMode },
+    );
+
+    const sent = await this.bot.api.sendMessage(
+      Number(target.chatId),
+      rest + tail,
+      {
+        ...this.threadSendOpts(target),
+        disable_notification: opts?.silent ?? false,
+        parse_mode: opts?.parseMode,
+      },
+    );
+    session.contentMessageId = sent.message_id;
+    session.contentBody = rest;
+    session.parseMode = opts?.parseMode;
+  }
+
+  async finalizeAssistant(
+    target: OutgoingTarget,
+    doneTail: string,
+    opts?: SendOptions & { fullBody?: string },
+  ): Promise<void> {
     const key = this.workKey(target);
     const session = this.workSessions.get(key);
     if (!session) return;
 
+    this.clearWorkTimers(session);
+
+    const parseMode = opts?.parseMode ?? session.parseMode;
+    const body = opts?.fullBody ?? session.contentBody ?? "";
+
+    try {
+      if (session.contentMessageId != null) {
+        const bodyLimit = TELEGRAM_TEXT_LIMIT - doneTail.length;
+        const chunks =
+          bodyLimit > 0 ? chunkText(body, bodyLimit) : [body];
+        const lastChunk = chunks[chunks.length - 1] ?? "";
+
+        const edit = async (messageId: number, text: string): Promise<void> => {
+          try {
+            await this.bot.api.editMessageText(
+              Number(target.chatId),
+              messageId,
+              text,
+              { parse_mode: parseMode },
+            );
+          } catch {
+            if (parseMode === "HTML") {
+              await this.bot.api.editMessageText(
+                Number(target.chatId),
+                messageId,
+                text,
+              );
+            }
+          }
+        };
+
+        if (chunks.length === 1) {
+          await edit(session.contentMessageId, lastChunk + doneTail);
+        } else {
+          await edit(session.contentMessageId, chunks[0]!);
+          for (let i = 1; i < chunks.length - 1; i++) {
+            await this.bot.api.sendMessage(
+              Number(target.chatId),
+              chunks[i]!,
+              {
+                ...this.threadSendOpts(target),
+                parse_mode: parseMode,
+              },
+            );
+          }
+          await this.bot.api.sendMessage(
+            Number(target.chatId),
+            lastChunk + doneTail,
+            {
+              ...this.threadSendOpts(target),
+              parse_mode: parseMode,
+            },
+          );
+        }
+      } else if (session.statusMessageId != null) {
+        await this.bot.api.editMessageText(
+          Number(target.chatId),
+          session.statusMessageId,
+          doneTail,
+          { parse_mode: parseMode },
+        );
+      }
+    } catch {
+      // Too old to edit — ignore.
+    }
+
+    this.workSessions.delete(key);
+  }
+
+  private clearWorkTimers(session: WorkSession): void {
     clearInterval(session.typingTimer);
     clearInterval(session.heartbeatTimer);
-    this.workSessions.delete(key);
+  }
 
+  private statusToContentTail(statusLine: string): string {
+    const s = statusLine.trim();
+    return `${MESSAGE_TAIL_SEP}${s}`;
+  }
+
+  private async setContentTail(
+    session: WorkSession,
+    target: OutgoingTarget,
+    statusLine: string,
+  ): Promise<void> {
+    if (session.contentMessageId == null) return;
+    const tail = this.statusToContentTail(statusLine);
+    if (tail === session.activeTail) return;
+    session.activeTail = tail;
+    const text = (session.contentBody ?? "") + tail;
+    if (text.length > TELEGRAM_TEXT_LIMIT) return;
+    try {
+      await this.bot.api.editMessageText(
+        Number(target.chatId),
+        session.contentMessageId,
+        text,
+        { parse_mode: session.parseMode },
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  private async dismissStatusBubble(
+    session: WorkSession,
+    target: OutgoingTarget,
+  ): Promise<void> {
+    if (session.statusMessageId == null) return;
     try {
       await this.bot.api.deleteMessage(
         Number(target.chatId),
         session.statusMessageId,
       );
     } catch {
-      // Already deleted or too old — ignore.
+      // ignore
     }
+    session.statusMessageId = undefined;
+  }
+
+  async endWork(target: OutgoingTarget): Promise<void> {
+    const key = this.workKey(target);
+    const session = this.workSessions.get(key);
+    if (!session) return;
+
+    this.clearWorkTimers(session);
+
+    if (session.statusMessageId != null) {
+      try {
+        await this.bot.api.deleteMessage(
+          Number(target.chatId),
+          session.statusMessageId,
+        );
+      } catch {
+        // Already deleted or too old — ignore.
+      }
+    }
+
+    this.workSessions.delete(key);
   }
 
   private workKey(target: OutgoingTarget): string {

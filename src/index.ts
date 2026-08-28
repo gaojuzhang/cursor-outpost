@@ -5,6 +5,9 @@ import { Store } from "./store/db.js";
 import { TelegramChannel } from "./channels/telegram/bot.js";
 import { Router } from "./core/router.js";
 import { ActiveStreamTracker } from "./sync/active-streams.js";
+import { AgentCatalog } from "./sync/agent-catalog.js";
+import { ModelCatalog } from "./sync/model-catalog.js";
+import { RepoCatalog } from "./sync/repo-catalog.js";
 import { Poller } from "./sync/poller.js";
 
 async function main(): Promise<void> {
@@ -29,6 +32,9 @@ async function main(): Promise<void> {
   store.syncProjectsFromConfig(config.projects);
   store.syncAllowlist("telegram", config.telegramAllowUserIds);
   const projects = store.listProjects();
+  if (projects.length === 0) {
+    console.log("outpost: no config projects — private chat disabled until default repo set");
+  }
   console.log(
     `outpost: db ok (${config.paths.stateDb}, projects=${projects.length}` +
       (projects.length
@@ -48,6 +54,20 @@ async function main(): Promise<void> {
 
   const streams = new ActiveStreamTracker();
 
+  const catalog = new AgentCatalog({
+    store,
+    cursor: client,
+    intervalMs: config.agent_catalog.interval_ms,
+  });
+  catalog.start();
+
+  const models = new ModelCatalog({ cursor: client });
+
+  const repos = new RepoCatalog({
+    cursor: client,
+    intervalMs: config.repo_catalog.interval_ms,
+  });
+
   const telegram = new TelegramChannel({
     token: config.telegramBotToken,
     store,
@@ -60,6 +80,9 @@ async function main(): Promise<void> {
     channel: telegram,
     config,
     streams,
+    catalog,
+    models,
+    repos,
   });
 
   const poller = new Poller({
@@ -95,6 +118,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string) => {
     console.log(`outpost: ${signal}, shutting down…`);
+    catalog.stop();
     poller.stop();
     await telegram.stop();
     store.close();

@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
+import { slugFromRepoUrl } from "./core/repo-url.js";
 
 const CONFIG_DIR_NAME = "cursor-outpost";
 const CURSOR_API_BASE = "https://api.cursor.com/v1";
@@ -20,6 +21,8 @@ export type AppConfig = {
   projects: ProjectConfig[];
   telegram: { verbose: boolean };
   poller: { interval_ms: number };
+  agent_catalog: { interval_ms: number };
+  repo_catalog: { interval_ms: number };
   paths: {
     configDir: string;
     configYaml: string;
@@ -75,6 +78,8 @@ type YamlRoot = {
   }>;
   telegram?: { verbose?: boolean };
   poller?: { interval_ms?: number };
+  agent_catalog?: { interval_ms?: number };
+  repo_catalog?: { interval_ms?: number };
 };
 
 export function loadConfig(configDir = join(homedir(), ".config", CONFIG_DIR_NAME)): AppConfig {
@@ -106,13 +111,15 @@ export function loadConfig(configDir = join(homedir(), ".config", CONFIG_DIR_NAM
   }
 
   const projects: ProjectConfig[] = (raw.projects ?? []).map((p, i) => {
-    if (!p?.slug || !p?.repo_url || !p?.ref) {
+    if (!p?.repo_url || !p?.ref) {
       throw new Error(
-        `projects[${i}] must have slug, repo_url, and ref in ${paths.configYaml}`,
+        `projects[${i}] must have repo_url and ref in ${paths.configYaml}`,
       );
     }
+    const slug =
+      p.slug?.trim() || slugFromRepoUrl(p.repo_url);
     return {
-      slug: p.slug,
+      slug,
       repo_url: p.repo_url,
       ref: p.ref,
       default: Boolean(p.default),
@@ -141,6 +148,20 @@ export function loadConfig(configDir = join(homedir(), ".config", CONFIG_DIR_NAM
         typeof raw.poller?.interval_ms === "number" && raw.poller.interval_ms > 0
           ? raw.poller.interval_ms
           : 8000,
+    },
+    agent_catalog: {
+      interval_ms:
+        typeof raw.agent_catalog?.interval_ms === "number" &&
+        raw.agent_catalog.interval_ms > 0
+          ? raw.agent_catalog.interval_ms
+          : 300_000,
+    },
+    repo_catalog: {
+      interval_ms:
+        typeof raw.repo_catalog?.interval_ms === "number" &&
+        raw.repo_catalog.interval_ms > 0
+          ? raw.repo_catalog.interval_ms
+          : 180_000,
     },
     paths,
     apiBase: CURSOR_API_BASE,

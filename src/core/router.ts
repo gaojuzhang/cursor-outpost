@@ -1,3 +1,6 @@
+import { isGenericAgentName } from "./agent-label.js";
+import { logModel } from "./model-log.js";
+import { AUTO_MODEL_ID, isAutoModelId } from "./model-prefs.js";
 import type { AppConfig } from "../config.js";
 import type {
   ChannelAdapter,
@@ -9,41 +12,67 @@ import type {
 import {
   augmentPromptWithImageNote,
   formatAgentBusyRetry,
+  formatBindAlreadyBound,
+  formatBindConfirmRequired,
+  formatBindCurrentBinding,
+  formatBindOk,
+  formatBindUsage,
   formatCancelNoAgent,
   formatCancelNoRun,
   formatCancelNotAllowed,
   formatCancelOk,
+  formatContextNearlyFull,
+  formatContextSummarized,
+  formatContextSummarizing,
+  formatContextUsageNote,
   formatCursorError,
-  formatDoneFooter,
   formatDrainingQueue,
+  formatModelListEntry,
+  formatModelListFooter,
+  formatModelListHeader,
+  formatModelNotFound,
+  formatModelSet,
   formatNewSession,
-  formatPollingFallback,
   formatQueued,
   formatQueueDiscarded,
   formatQueueStale,
-  formatRunStatus,
-  formatStreamError,
-  formatThinking,
-  formatToolCall,
+  formatRepoListEmpty,
+  formatRepoListEntryHtml,
+  formatRepoListFooter,
+  formatRepoListHeader,
+  formatSessionCacheFresh,
+  formatSessionListFooterHtml,
+  formatSessionListHeader,
+  formatSessionListHeaderHtml,
+  formatSessionListTableHtmlChunks,
+  formatSessionNotFound,
+  formatSessionRefreshOk,
+  formatSessionResumed,
   formatWorkStatus,
+  TELEGRAM_TEXT_LIMIT,
 } from "../channels/telegram/format.js";
-import {
-  CursorApiError,
-  isStreamGoneCode,
-  isStreamGoneError,
-  type CursorClient,
-} from "../cursor/client.js";
-import { isTerminalRunStatus, type Run, type StreamEvent } from "../cursor/types.js";
-import type { Store } from "../store/db.js";
+import { CursorApiError, type CursorClient } from "../cursor/client.js";
+import { isTerminalRunStatus } from "../cursor/types.js";
+import type { CachedAgentRow, Store, ThreadBinding } from "../store/db.js";
+import { repoUrlMatches } from "./repo-url.js";
+import { AgentCatalog } from "../sync/agent-catalog.js";
+import { ModelCatalog } from "../sync/model-catalog.js";
+import { RepoCatalog } from "../sync/repo-catalog.js";
 import { AgentQueue } from "../sync/queue.js";
 import type { ActiveStreamTracker } from "../sync/active-streams.js";
+import {
+  contextUsagePct,
+  estimateContextTokens,
+  normalizeObservedUsage,
+  type ObservedTokenUsage,
+  shouldWarnNearFull,
+} from "./context-observe.js";
+import { RunBodyResolver } from "../delivery/run-body-resolver.js";
+import { RunSession } from "../delivery/run-session.js";
+import { TelegramRunPresenter } from "../delivery/telegram-presenter.js";
 
-const ASSISTANT_FLUSH_AT = 3500;
 const POLL_INTERVAL_MS = 2500;
 const POLL_MAX_MS = 30 * 60 * 1000;
-const STREAM_OPEN_ATTEMPTS = 4;
-const STREAM_OPEN_DELAY_MS = 1000;
-const RUN_CREATING_WAIT_MS = 20_000;
 
 export type RouterDeps = {
   store: Store;
@@ -51,6 +80,9 @@ export type RouterDeps = {
   channel: ChannelAdapter;
   config: AppConfig;
   streams: ActiveStreamTracker;
+  catalog: AgentCatalog;
+  models: ModelCatalog;
+  repos: RepoCatalog;
 };
 
 /**
@@ -63,6 +95,10 @@ export class Router {
   private readonly channel: ChannelAdapter;
   private readonly config: AppConfig;
   private readonly streams: ActiveStreamTracker;
+  private readonly catalog: AgentCatalog;
+  private readonly models: ModelCatalog;
+  private readonly repos: RepoCatalog;
+  private readonly runBodyResolver: RunBodyResolver;
   private readonly queue = new AgentQueue();
   /** agentId currently draining the queue */
   private readonly pumping = new Set<string>();
@@ -73,6 +109,14 @@ export class Router {
     this.channel = deps.channel;
     this.config = deps.config;
     this.streams = deps.streams;
+    this.catalog = deps.catalog;
+    this.models = deps.models;
+    this.repos = deps.repos;
+    this.runBodyResolver = new RunBodyResolver({
+      cursor: this.cursor,
+      getOutboundPromptText: (agentId, runId) =>
+        this.store.getOutboundPromptText(agentId, runId),
+    });
   }
 
   private async workBegin(target: OutgoingTarget, status: string): Promise<void> {
@@ -105,6 +149,113 @@ export class Router {
     await this.channel.sendText(target, text, opts);
   }
 
+  private verboseFor(
+    msg: Pick<IncomingMessage, "channel" | "chatId" | "threadId">,
+  ): boolean {
+    return this.store.resolveVerbose(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+      this.config.telegram.verbose,
+    );
+  }
+
+  private async observeContextFromUsage(
+    target: OutgoingTarget,
+    usage: ObservedTokenUsage | undefined,
+    state: { nearFullWarned: boolean },
+    verbose: boolean,
+  ): Promise<void> {
+    const normalized = normalizeObservedUsage(usage);
+    if (!normalized) return;
+    const tokens = estimateContextTokens(normalized);
+    const pct = contextUsagePct(tokens);
+    if (verbose && pct >= 50) {
+      await this.sendOut(target, formatContextUsageNote(pct, tokens), {
+        silent: true,
+      });
+    }
+    if (shouldWarnNearFull(tokens) && !state.nearFullWarned) {
+      state.nearFullWarned = true;
+      await this.sendOut(target, formatContextNearlyFull(pct, tokens));
+    }
+  }
+
+  private async notifyContextSummarizing(
+    target: OutgoingTarget,
+    state: { summarizingNotified: boolean },
+  ): Promise<void> {
+    if (state.summarizingNotified) return;
+    state.summarizingNotified = true;
+    await this.sendOut(target, formatContextSummarizing());
+  }
+
+  private async notifyContextSummarized(target: OutgoingTarget): Promise<void> {
+    await this.sendOut(target, formatContextSummarized());
+  }
+
+  private async observeRunContextUsage(
+    target: OutgoingTarget,
+    agentId: string,
+    runId: string,
+    state: { nearFullWarned: boolean },
+    verbose: boolean,
+  ): Promise<void> {
+    try {
+      const usage = await this.cursor.getRunTokenUsage(agentId, runId);
+      await this.observeContextFromUsage(target, usage, state, verbose);
+    } catch {
+      /* run gone or usage unavailable */
+    }
+  }
+
+  private async deliverRun(opts: {
+    target: OutgoingTarget;
+    agentId: string;
+    agentUrl: string;
+    runId: string;
+    verbose: boolean;
+  }): Promise<void> {
+    const { target, agentId, agentUrl, runId, verbose } = opts;
+    const contextState = { nearFullWarned: false };
+    const summaryState = { summarizingNotified: false };
+
+    const session = new RunSession({
+      cursor: this.cursor,
+      resolver: this.runBodyResolver,
+      presenter: new TelegramRunPresenter(this.channel),
+      streams: this.streams,
+      hooks: {
+        onUsage: (t, u) =>
+          this.observeContextFromUsage(t, u, contextState, verbose),
+        onSummarizing: (t) => this.notifyContextSummarizing(t, summaryState),
+        onSummarized: (t) => this.notifyContextSummarized(t),
+      },
+    });
+
+    try {
+      const outcome = await session.deliver({
+        target,
+        agentId,
+        agentUrl,
+        runId,
+        verbose,
+      });
+      if (!outcome.usage) {
+        await this.observeRunContextUsage(
+          target,
+          agentId,
+          runId,
+          contextState,
+          verbose,
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, `❌ Stream failed: ${message}`);
+    }
+  }
+
   async handle(msg: IncomingMessage): Promise<void> {
     const target: OutgoingTarget = {
       channel: msg.channel,
@@ -132,15 +283,30 @@ export class Router {
       return;
     }
 
+    if (msg.command === "resume" || msg.command === "sessions") {
+      await this.cmdResume(msg, target);
+      return;
+    }
+
     if (msg.command === "cancel") {
       await this.cmdCancel(msg, target);
+      return;
+    }
+
+    if (msg.command === "model") {
+      await this.cmdModel(msg, target);
+      return;
+    }
+
+    if (msg.command === "repos") {
+      await this.cmdRepos(msg, target);
       return;
     }
 
     if (msg.command) {
       await this.channel.sendText(
         target,
-        `Unknown command /${msg.command}. Try: /bind /status /new /cancel /verbose on|off /ping`,
+        `Unknown command /${msg.command}. Try: /bind /repos /status /new /resume /model /cancel /verbose on|off /ping`,
       );
       return;
     }
@@ -151,17 +317,42 @@ export class Router {
     await this.routePrompt(msg, target, text, msg.images);
   }
 
-  private defaultSlug(): string {
+  private defaultProject(): {
+    slug: string;
+    repo_url: string;
+    ref: string;
+  } {
     const marked = this.config.projects.find((p) => p.default);
-    if (marked) return marked.slug;
-    if (this.config.projects.length === 1) return this.config.projects[0]!.slug;
+    if (marked) return marked;
+    if (this.config.projects.length === 1) {
+      return this.config.projects[0]!;
+    }
     throw new Error(
-      "config.yaml needs exactly one project with default: true (for private chat)",
+      "config.yaml needs a default project for private chat (default: true on one entry)",
     );
   }
 
-  private projectSlugs(): string {
-    return this.store.listProjects().map((p) => p.slug).join(", ") || "(none)";
+  private defaultSlug(): string {
+    return this.defaultProject().slug;
+  }
+
+  private parseBindArgs(raw: string): {
+    token: string;
+    confirmed: boolean;
+    missingTokenAfterConfirm?: boolean;
+  } {
+    const tokens = raw.trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) {
+      return { token: "", confirmed: false };
+    }
+    const last = tokens[tokens.length - 1]!.toLowerCase();
+    const confirmed = last === "confirm" || last === "确认";
+    const token = confirmed ? tokens.slice(0, -1).join(" ").trim() : raw.trim();
+    return {
+      token,
+      confirmed,
+      missingTokenAfterConfirm: confirmed && !token,
+    };
   }
 
   private async cmdBind(
@@ -169,9 +360,10 @@ export class Router {
     target: OutgoingTarget,
   ): Promise<void> {
     if (msg.chatKind === "dm") {
+      const dm = this.defaultProject();
       await this.channel.sendText(
         target,
-        `Private chat uses the default project from config.yaml (no /bind).\nProjects: ${this.projectSlugs()}`,
+        `私聊使用 config 默认仓库（无需 /bind）\n${dm.slug} → ${dm.repo_url}@${dm.ref}`,
       );
       return;
     }
@@ -183,41 +375,185 @@ export class Router {
       return;
     }
 
-    const slug = (msg.commandArgs ?? "").trim();
-    if (!slug) {
-      await this.channel.sendText(
-        target,
-        `Usage: /bind <slug>\nProjects: ${this.projectSlugs()}`,
-      );
-      return;
-    }
-
-    const project = this.store.getProject(slug);
-    if (!project) {
-      await this.channel.sendText(
-        target,
-        `Unknown slug "${slug}". Projects: ${this.projectSlugs()}`,
-      );
-      return;
-    }
-
-    const { previousAgentId } = this.store.bindThread(
+    const thread = this.store.getActiveThread(
       msg.channel,
       msg.chatId,
       msg.threadId,
-      slug,
+    );
+    const currentBinding = this.store.resolveThreadBinding(thread);
+    const rawArgs = (msg.commandArgs ?? "").trim();
+
+    if (!rawArgs) {
+      if (currentBinding) {
+        await this.channel.sendText(
+          target,
+          formatBindCurrentBinding({
+            slug: currentBinding.slug,
+            repoUrl: currentBinding.repo_url,
+            ref: currentBinding.ref,
+            agentId: thread?.agent_id,
+          }),
+        );
+        return;
+      }
+      await this.channel.sendText(target, formatBindUsage());
+      return;
+    }
+
+    const parsed = this.parseBindArgs(rawArgs);
+    if (parsed.missingTokenAfterConfirm) {
+      await this.channel.sendText(
+        target,
+        "用法：/bind <序号|仓库名> confirm\n先 /repos 查看列表",
+      );
+      return;
+    }
+
+    let repoList: Awaited<ReturnType<RepoCatalog["list"]>>;
+    try {
+      repoList = await this.repos.list(false);
+      this.repos.syncToStore(this.store, repoList);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, formatCursorError(message));
+      return;
+    }
+
+    const picked = this.repos.resolveToken(parsed.token, repoList);
+    if (!picked) {
+      await this.channel.sendText(
+        target,
+        `未找到「${parsed.token}」。先 /repos 查看序号或仓库名。`,
+      );
+      return;
+    }
+
+    const newBinding: ThreadBinding = {
+      slug: this.repos.slug(picked.url),
+      repo_url: picked.url,
+      ref: "main",
+    };
+    this.store.upsertCursorRepos([
+      { slug: newBinding.slug, repoUrl: newBinding.repo_url, ref: newBinding.ref },
+    ]);
+
+    if (
+      currentBinding &&
+      repoUrlMatches(currentBinding.repo_url, newBinding.repo_url)
+    ) {
+      await this.channel.sendText(
+        target,
+        formatBindAlreadyBound({
+          slug: newBinding.slug,
+          repoUrl: newBinding.repo_url,
+          ref: newBinding.ref,
+          agentId: thread?.agent_id,
+        }),
+      );
+      return;
+    }
+
+    if (currentBinding && !parsed.confirmed) {
+      await this.channel.sendText(
+        target,
+        formatBindConfirmRequired({
+          currentSlug: currentBinding.slug,
+          currentRepo: currentBinding.repo_url,
+          currentRef: currentBinding.ref,
+          currentAgentId: thread?.agent_id,
+          newSlug: newBinding.slug,
+          newRepo: newBinding.repo_url,
+          newRef: newBinding.ref,
+        }),
+      );
+      return;
+    }
+
+    const { previousAgentId } = this.store.bindThreadRepo(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+      newBinding,
     );
     if (previousAgentId) {
       this.queue.clear(previousAgentId);
+      this.streams.clearAgent(previousAgentId);
+      this.cursor.clearAgentCache(previousAgentId);
+      this.store.clearAgentSyncState(previousAgentId);
     }
 
     await this.channel.sendText(
       target,
-      `Bound this topic to ${slug}\n${project.repo_url}@${project.ref}` +
-        (previousAgentId
-          ? "\n(Previous agent mapping cleared; next message creates a new agent.)"
-          : ""),
+      formatBindOk({
+        slug: newBinding.slug,
+        repoUrl: newBinding.repo_url,
+        ref: newBinding.ref,
+        clearedAgent: Boolean(previousAgentId),
+      }),
     );
+  }
+
+  private async cmdRepos(
+    msg: IncomingMessage,
+    target: OutgoingTarget,
+  ): Promise<void> {
+    const args = (msg.commandArgs ?? "").trim();
+    const forceRefresh =
+      args.toLowerCase() === "refresh" ||
+      args === "刷新" ||
+      args.toLowerCase() === "reload";
+
+    if (!forceRefresh) {
+      const last = this.repos.lastLoadedAt();
+      const interval = this.config.repo_catalog.interval_ms;
+      if (last != null && Date.now() - last < interval) {
+        await this.sendRepoList(target, false, true);
+        return;
+      }
+    }
+
+    try {
+      await this.repos.list(forceRefresh);
+      this.repos.syncToStore(this.store);
+      await this.sendRepoList(target, forceRefresh, false);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, formatCursorError(message));
+    }
+  }
+
+  private async sendRepoList(
+    target: OutgoingTarget,
+    forced: boolean,
+    fromCacheOnly: boolean,
+  ): Promise<void> {
+    const list = await this.repos.list(false);
+    const header = formatRepoListHeader({
+      count: list.length,
+      syncedAt: this.repos.lastLoadedAt(),
+      forced,
+      fromCache: fromCacheOnly && !forced,
+    });
+    if (list.length === 0) {
+      await this.sendOut(
+        target,
+        `${header}\n${formatRepoListEmpty()}`,
+      );
+      return;
+    }
+    const entries = list.map((r, i) =>
+      formatRepoListEntryHtml(i + 1, r.url, this.repos.slug(r.url)),
+    );
+    const fullHtml = [header, ...entries, formatRepoListFooter()].join("\n\n");
+    if (fullHtml.length <= TELEGRAM_TEXT_LIMIT) {
+      await this.sendOut(target, fullHtml, { parseMode: "HTML" });
+      return;
+    }
+    await this.sendOut(target, header, { parseMode: "HTML" });
+    for (const entry of entries) {
+      await this.sendOut(target, entry, { parseMode: "HTML" });
+    }
+    await this.sendOut(target, formatRepoListFooter(), { parseMode: "HTML" });
   }
 
   private async cmdStatus(
@@ -238,16 +574,141 @@ export class Router {
     const agentId = thread?.agent_id ?? undefined;
     const streaming = agentId ? this.streams.get(agentId) : undefined;
     const queued = agentId ? this.queue.size(agentId) : 0;
+    const prefModel = this.store.resolveModelId(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+    const prefLabel = this.models.formatIdLabel(prefModel);
+    let modelLine = `model: ${prefLabel}`;
+    if (agentId) {
+      const live = this.cursor.getCachedAgentModel(agentId);
+      if (live) {
+        const liveLabel = this.models.formatIdLabel(live);
+        if (liveLabel !== prefLabel) {
+          modelLine += ` (agent: ${liveLabel})`;
+        }
+      }
+    }
     const lines = [
       `chatKind: ${msg.chatKind}`,
-      `slug: ${thread?.slug ?? (msg.chatKind === "dm" ? `(default ${this.defaultSlug()})` : "(not bound — /bind <slug>)")}`,
+      `slug: ${thread?.slug ?? (msg.chatKind === "dm" ? `(default ${this.defaultSlug()})` : "(not bound — /repos + /bind)")}`,
       `agent: ${thread?.agent_id ?? "(none)"}`,
       `url: ${thread?.agent_url ?? "(none)"}`,
+      modelLine,
       `verbose: ${verbose ? "on" : "off"}`,
       `streaming_run: ${streaming ?? "(none)"}`,
       `queue: ${queued}`,
     ];
     await this.channel.sendText(target, lines.join("\n"));
+  }
+
+  private async cmdModel(
+    msg: IncomingMessage,
+    target: OutgoingTarget,
+  ): Promise<void> {
+    const args = (msg.commandArgs ?? "").trim();
+    const thread = this.store.getActiveThread(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+    const preferred = this.store.resolveModelId(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+
+    const forceRefresh =
+      args.toLowerCase() === "refresh" ||
+      args === "刷新" ||
+      args.toLowerCase() === "reload";
+
+    if (!args || forceRefresh) {
+      try {
+        const all = await this.models.list(forceRefresh);
+        const picker = this.models.pickerModels(all, 15);
+        const prefLabel = this.models.formatIdLabel(preferred, all);
+        let agentLabel: string | undefined;
+        if (thread?.agent_id) {
+          const live = this.cursor.getCachedAgentModel(thread.agent_id);
+          if (live) agentLabel = this.models.formatIdLabel(live, all);
+        }
+        const header = formatModelListHeader({
+          preferenceLabel: prefLabel,
+          agentModelLabel: agentLabel,
+          forced: forceRefresh,
+        });
+        const lines = [header];
+        picker.forEach((m, i) => {
+          lines.push(
+            formatModelListEntry(i + 1, m.id, m.displayName, preferred),
+          );
+        });
+        lines.push(formatModelListFooter());
+        await this.sendOut(target, lines.join("\n"));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await this.sendOut(target, formatCursorError(message));
+      }
+      return;
+    }
+
+    try {
+      const all = await this.models.list(false);
+      const resolved = this.models.resolveToken(args, all, 15);
+      if (!resolved) {
+        await this.sendOut(target, formatModelNotFound(args));
+        return;
+      }
+      const nextId =
+        resolved === "auto" ||
+        (typeof resolved !== "string" && isAutoModelId(resolved.id))
+          ? AUTO_MODEL_ID
+          : resolved.id;
+      const verbose = this.verboseFor(msg);
+      logModel(
+        verbose,
+        `outpost: model cmd set thread=${msg.threadId} chat=${msg.chatId} token=${args} resolved=${resolved === "auto" ? "auto" : resolved.id} nextId=${nextId} prev=${preferred ?? "auto"} agent=${thread?.agent_id ?? "none"}`,
+      );
+      this.store.setThreadModel(
+        msg.channel,
+        msg.chatId,
+        msg.threadId,
+        nextId,
+      );
+      const stored = this.store.resolveModelId(
+        msg.channel,
+        msg.chatId,
+        msg.threadId,
+      );
+      logModel(
+        verbose,
+        `outpost: model cmd db stored=${stored ?? "auto"} thread=${msg.threadId}`,
+      );
+      if (thread?.agent_id) {
+        await this.cursor.applyAgentModel(thread.agent_id, nextId, verbose);
+        const live = this.cursor.getCachedAgentModel(thread.agent_id);
+        logModel(
+          verbose,
+          `outpost: model cmd applied agent=${thread.agent_id} live=${live ?? "unset"}`,
+        );
+      } else {
+        logModel(
+          verbose,
+          `outpost: model cmd skip apply (no agent yet) thread=${msg.threadId}`,
+        );
+      }
+      const label = this.models.formatIdLabel(nextId, all);
+      let reply = formatModelSet(label);
+      if (thread?.agent_id) {
+        reply += "\n已同步到当前 agent（Agents Window 应显示该选择）。";
+      }
+      await this.sendOut(target, reply);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, formatCursorError(message));
+    }
   }
 
   private async cmdNew(
@@ -260,13 +721,236 @@ export class Router {
       msg.threadId,
     );
     if (thread?.agent_id) {
-      const cleared = this.queue.clear(thread.agent_id);
+      const oldAgentId = thread.agent_id;
+      const cleared = this.queue.clear(oldAgentId);
       if (cleared > 0) {
         await this.sendOut(target, formatQueueDiscarded(cleared));
       }
+      this.streams.clearAgent(oldAgentId);
+      this.cursor.clearAgentCache(oldAgentId);
+      this.store.clearAgentSyncState(oldAgentId);
     }
     this.store.resetThreadAgent(msg.channel, msg.chatId, msg.threadId);
     await this.sendOut(target, formatNewSession());
+  }
+
+  private releaseThreadBinding(agentId: string): number {
+    return this.queue.clear(agentId);
+  }
+
+  private async cmdResume(
+    msg: IncomingMessage,
+    target: OutgoingTarget,
+  ): Promise<void> {
+    const args = (msg.commandArgs ?? "").trim();
+    const thread = this.store.getActiveThread(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+
+    let slug: string | undefined;
+    let projectRepo: string | undefined;
+    if (msg.chatKind === "dm") {
+      slug = this.defaultSlug();
+      projectRepo = this.defaultProject().repo_url;
+    } else if (msg.chatKind === "topic") {
+      const binding = this.store.resolveThreadBinding(thread);
+      if (binding) {
+        slug = binding.slug;
+        projectRepo = binding.repo_url;
+      }
+    }
+    if (slug) {
+      this.store.ensureActiveThread(
+        msg.channel,
+        msg.chatId,
+        msg.threadId,
+        slug,
+      );
+    }
+
+    const forceRefresh =
+      args === "refresh" || args === "更新" || args.toLowerCase() === "reload";
+
+    if (forceRefresh) {
+      try {
+        const n = await this.catalog.refresh(true);
+        if (n >= 0) {
+          await this.sendOut(target, formatSessionRefreshOk(n));
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        await this.sendOut(target, formatCursorError(message));
+        return;
+      }
+    }
+
+    const listOnly =
+      !args ||
+      args === "list" ||
+      args === "列表" ||
+      args === "refresh" ||
+      args === "更新" ||
+      args.toLowerCase() === "reload";
+
+    if (listOnly) {
+      if (!forceRefresh) {
+        const refreshed = await this.catalog.refresh(false);
+        if (refreshed === -1) {
+          await this.sendOut(target, formatSessionCacheFresh());
+        }
+      }
+      await this.sendSessionList(
+        target,
+        thread?.agent_id ?? undefined,
+        slug,
+        projectRepo,
+      );
+      return;
+    }
+
+    const pickToken = args;
+
+    const row = this.catalog.findInProject(projectRepo, pickToken);
+    if (!row && pickToken.startsWith("bc-")) {
+      try {
+        const agent = await this.cursor.warmAgent(pickToken);
+        await this.bindResumedAgent(msg, target, thread, agent);
+        return;
+      } catch {
+        await this.sendOut(target, formatSessionNotFound(pickToken));
+        return;
+      }
+    }
+    if (!row) {
+      await this.sendOut(target, formatSessionNotFound(pickToken));
+      return;
+    }
+
+    if (row.archived) {
+      await this.sendOut(
+        target,
+        "该 agent 已 archived，Cursor 可能无法继续 follow-up。可在 Agents Window 先 unarchive。",
+      );
+      return;
+    }
+
+    try {
+      const agent = await this.cursor.warmAgent(row.agent_id);
+      await this.bindResumedAgent(msg, target, thread, agent);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, formatCursorError(message));
+    }
+  }
+
+  private async bindResumedAgent(
+    msg: IncomingMessage,
+    target: OutgoingTarget,
+    thread: ReturnType<Store["getActiveThread"]>,
+    agent: { id: string; url: string; name?: string },
+  ): Promise<void> {
+    if (thread?.agent_id && thread.agent_id !== agent.id) {
+      const cleared = this.releaseThreadBinding(thread.agent_id);
+      if (cleared > 0) {
+        await this.sendOut(target, formatQueueDiscarded(cleared));
+      }
+      this.streams.clearAgent(thread.agent_id);
+      this.cursor.clearAgentCache(thread.agent_id);
+    }
+    this.store.setThreadAgent(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+      agent.id,
+      agent.url,
+    );
+    const modelPref = this.store.resolveModelId(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+    try {
+      await this.cursor.applyAgentModel(agent.id, modelPref, this.verboseFor(msg));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.sendOut(target, formatCursorError(message));
+      return;
+    }
+    const cached = this.store.listCachedAgents(500, true).find(
+      (r) => r.agent_id === agent.id,
+    );
+    let labelRow: CachedAgentRow = cached ?? {
+      agent_id: agent.id,
+      name: agent.name ?? agent.id,
+      summary: "",
+      display_name: null,
+      status: null,
+      archived: 0,
+      repos_json: null,
+      last_modified: 0,
+      synced_at: "",
+    };
+    if (
+      !labelRow.display_name?.trim() &&
+      isGenericAgentName(labelRow.name)
+    ) {
+      const enriched = await this.catalog.enrichDisplayNames([labelRow]);
+      labelRow = enriched[0] ?? labelRow;
+    }
+    await this.sendOut(
+      target,
+      formatSessionResumed(this.catalog.displayLabel(labelRow), agent.url),
+    );
+  }
+
+  private async sendSessionList(
+    target: OutgoingTarget,
+    currentAgentId: string | undefined,
+    projectSlug: string | undefined,
+    projectRepo: string | undefined,
+  ): Promise<void> {
+    const rows = await this.catalog.enrichStatuses(
+      await this.catalog.enrichDisplayNames(
+        this.catalog.listForProject(projectRepo, 15),
+      ),
+    );
+    const headerOpts = {
+      projectSlug,
+      syncedAt: this.catalog.lastSyncedAt(),
+      count: rows.length,
+      forced: false,
+    };
+    if (rows.length === 0) {
+      await this.sendOut(
+        target,
+        `${formatSessionListHeader(headerOpts)}(empty — try /resume refresh or create an agent in Cursor)`,
+      );
+      return;
+    }
+
+    const htmlHeader = formatSessionListHeaderHtml(headerOpts);
+    const tableChunks = formatSessionListTableHtmlChunks(
+      rows,
+      currentAgentId,
+      TELEGRAM_TEXT_LIMIT - htmlHeader.length - 200,
+    );
+    const htmlFooter = formatSessionListFooterHtml();
+
+    if (tableChunks.length === 1) {
+      const fullHtml = [htmlHeader, tableChunks[0]!, htmlFooter].join("\n\n");
+      if (fullHtml.length <= TELEGRAM_TEXT_LIMIT) {
+        await this.sendOut(target, fullHtml, { parseMode: "HTML" });
+        return;
+      }
+    }
+
+    await this.sendOut(target, htmlHeader, { parseMode: "HTML" });
+    for (const chunk of tableChunks) {
+      await this.sendOut(target, chunk, { parseMode: "HTML" });
+    }
+    await this.sendOut(target, htmlFooter, { parseMode: "HTML" });
   }
 
   private async cmdCancel(
@@ -309,33 +993,25 @@ export class Router {
     text: string,
     images?: IncomingImage[],
   ): Promise<void> {
-    let slug: string;
+    let project: { slug: string; repo_url: string; ref: string };
     if (msg.chatKind === "dm") {
-      slug = this.defaultSlug();
+      project = this.defaultProject();
     } else if (msg.chatKind === "topic") {
       const existing = this.store.getActiveThread(
         msg.channel,
         msg.chatId,
         msg.threadId,
       );
-      if (!existing?.slug) {
+      const binding = this.store.resolveThreadBinding(existing);
+      if (!binding) {
         await this.channel.sendText(
           target,
-          `This topic is not bound. Use /bind <slug>\nProjects: ${this.projectSlugs()}`,
+          "本 topic 未绑定仓库。\n先 /repos 查看列表，再 /bind 3 或 /bind fluxalpha",
         );
         return;
       }
-      slug = existing.slug;
+      project = binding;
     } else {
-      return;
-    }
-
-    const project = this.store.getProject(slug);
-    if (!project) {
-      await this.channel.sendText(
-        target,
-        `Project ${slug} is missing from the DB. Check config.yaml and restart.`,
-      );
       return;
     }
 
@@ -343,7 +1019,7 @@ export class Router {
       msg.channel,
       msg.chatId,
       msg.threadId,
-      slug,
+      project.slug,
     );
 
     // First message on thread: create agent (no queue key yet).
@@ -447,11 +1123,23 @@ export class Router {
           `outpost: image prompt footnote applied (${promptText.slice(0, 80).replace(/\n/g, " ")}…)`,
         );
       }
+      const modelId = this.store.resolveModelId(
+        msg.channel,
+        msg.chatId,
+        msg.threadId,
+      );
+      const verbose = this.verboseFor(msg);
+      logModel(
+        verbose,
+        `outpost: model startCreate thread=${msg.threadId} pref=${modelId ?? "auto"}`,
+      );
       const created = await this.cursor.createAgent({
         text: promptText,
         repoUrl: project.repo_url,
         startingRef: project.ref,
         images,
+        model: modelId,
+        modelLog: verbose,
       });
       agentId = created.agent.id;
       agentUrl = created.agent.url;
@@ -481,9 +1169,10 @@ export class Router {
     this.store.addOutboundPrompt(
       agentId,
       augmentPromptWithImageNote(text, images),
+      runId,
     );
 
-    await this.streamToChannel({
+    await this.deliverRun({
       target,
       agentId,
       agentUrl,
@@ -508,6 +1197,16 @@ export class Router {
   ): Promise<void> {
     let runId: string;
     let url = agentUrl;
+    const modelId = this.store.resolveModelId(
+      msg.channel,
+      msg.chatId,
+      msg.threadId,
+    );
+    const verbose = this.verboseFor(msg);
+    logModel(
+      verbose,
+      `outpost: model startFollowUp thread=${msg.threadId} agent=${agentId} pref=${modelId ?? "auto"}`,
+    );
     try {
       await this.workBegin(target, formatWorkStatus("Sending follow-up"));
       const promptText = augmentPromptWithImageNote(text, images);
@@ -518,12 +1217,24 @@ export class Router {
       }
       let created;
       try {
-        created = await this.cursor.createRun(agentId, promptText, images);
+        created = await this.cursor.createRun(
+          agentId,
+          promptText,
+          images,
+          modelId,
+          verbose,
+        );
       } catch (err) {
         if (err instanceof CursorApiError && err.status === 409) {
           await this.workUpdate(target, formatAgentBusyRetry());
           await this.waitUntilAgentIdle(agentId);
-          created = await this.cursor.createRun(agentId, promptText, images);
+          created = await this.cursor.createRun(
+            agentId,
+            promptText,
+            images,
+            modelId,
+            verbose,
+          );
         } else {
           throw err;
         }
@@ -556,9 +1267,10 @@ export class Router {
     this.store.addOutboundPrompt(
       agentId,
       augmentPromptWithImageNote(text, images),
+      runId,
     );
 
-    await this.streamToChannel({
+    await this.deliverRun({
       target,
       agentId,
       agentUrl: url ?? "",
@@ -572,233 +1284,6 @@ export class Router {
     });
   }
 
-  private async streamToChannel(opts: {
-    target: OutgoingTarget;
-    agentId: string;
-    agentUrl: string;
-    runId: string;
-    verbose: boolean;
-  }): Promise<void> {
-    const { target, agentId, agentUrl, runId, verbose } = opts;
-    this.streams.set(agentId, runId);
-
-    let assistantBuf = "";
-    let thinkingBuf = "";
-    let lastStatus: string | undefined;
-    let assistantSent = false;
-    let terminalText: string | undefined;
-    let terminalGit: Run["git"] | undefined;
-    let sawResult = false;
-
-    const flushAssistant = async (force = false): Promise<void> => {
-      while (
-        assistantBuf.length >= ASSISTANT_FLUSH_AT ||
-        (force && assistantBuf.length > 0)
-      ) {
-        const take = Math.min(assistantBuf.length, ASSISTANT_FLUSH_AT);
-        const piece = assistantBuf.slice(0, take);
-        assistantBuf = assistantBuf.slice(take);
-        await this.sendOut(target, piece);
-        assistantSent = true;
-      }
-    };
-
-    const flushThinking = async (force = false): Promise<void> => {
-      if (!verbose) {
-        thinkingBuf = "";
-        return;
-      }
-      while (
-        thinkingBuf.length >= ASSISTANT_FLUSH_AT ||
-        (force && thinkingBuf.trim().length > 0)
-      ) {
-        const take = Math.min(thinkingBuf.length, ASSISTANT_FLUSH_AT);
-        const piece = thinkingBuf.slice(0, take);
-        thinkingBuf = thinkingBuf.slice(take);
-        const line = formatThinking(piece, { verbose: true });
-        if (line) await this.sendOut(target, line, { silent: true });
-      }
-    };
-
-    const handleEvent = async (ev: StreamEvent): Promise<void> => {
-      switch (ev.type) {
-        case "status":
-          if (ev.data.status !== lastStatus) {
-            lastStatus = ev.data.status;
-            await this.workUpdate(target, formatRunStatus(ev.data.status));
-          }
-          break;
-        case "assistant":
-          await flushThinking(true);
-          assistantBuf += ev.data.text;
-          await flushAssistant(false);
-          break;
-        case "thinking":
-          thinkingBuf += ev.data.text;
-          await flushThinking(false);
-          break;
-        case "tool_call": {
-          await flushThinking(true);
-          const line = formatToolCall(ev.data.name, ev.data.status, {
-            verbose,
-          });
-          if (line) await this.sendOut(target, line, { silent: true });
-          break;
-        }
-        case "result":
-          sawResult = true;
-          terminalText = ev.data.text;
-          terminalGit = ev.data.git;
-          break;
-        case "error":
-          // Mid-stream "gone" — same as HTTP 409/410: fall back to getRun.
-          if (isStreamGoneCode(ev.data.code)) {
-            throw new CursorApiError(
-              409,
-              ev.data.message,
-              ev.data.code,
-            );
-          }
-          await this.sendOut(
-            target,
-            formatStreamError(ev.data.code, ev.data.message),
-          );
-          break;
-        default:
-          break;
-      }
-    };
-
-    try {
-      let streamEventCount = 0;
-      const preflight = await this.waitForRunActive(agentId, runId);
-
-      if (isTerminalRunStatus(preflight.status)) {
-        console.log(
-          `outpost: run already ${preflight.status} before stream attach, using getRun`,
-        );
-        terminalText = preflight.result;
-        terminalGit = preflight.git;
-        sawResult = true;
-      } else {
-        let streamDone = false;
-        for (let attempt = 0; attempt < STREAM_OPEN_ATTEMPTS; attempt++) {
-          try {
-            for await (const ev of this.cursor.streamRun(agentId, runId)) {
-              streamEventCount++;
-              await handleEvent(ev);
-            }
-            streamDone = true;
-            break;
-          } catch (err) {
-            if (!isStreamGoneError(err)) throw err;
-
-            const snap = await this.cursor.getRun(agentId, runId);
-            if (isTerminalRunStatus(snap.status)) {
-              console.log(
-                `outpost: stream unavailable (${err.status} ${err.code ?? ""}) ` +
-                  `after ${streamEventCount} events, run=${snap.status} — using getRun`,
-              );
-              terminalText = snap.result;
-              terminalGit = snap.git;
-              sawResult = true;
-              streamDone = true;
-              break;
-            }
-
-            if (attempt + 1 < STREAM_OPEN_ATTEMPTS) {
-              console.log(
-                `outpost: stream unavailable (${err.status} ${err.code ?? ""}) ` +
-                  `attempt ${attempt + 1}/${STREAM_OPEN_ATTEMPTS}, ` +
-                  `events=${streamEventCount}, run=${snap.status} — retrying…`,
-              );
-              await this.workUpdate(target, formatPollingFallback());
-              await new Promise((r) =>
-                setTimeout(r, STREAM_OPEN_DELAY_MS * (attempt + 1)),
-              );
-              continue;
-            }
-
-            console.log(
-              `outpost: stream unavailable (${err.status} ${err.code ?? ""}) ` +
-                `after ${streamEventCount} events, run=${snap.status} — polling getRun…`,
-            );
-            await this.workUpdate(target, formatPollingFallback());
-            const run = await this.waitForRunTerminal(agentId, runId);
-            terminalText = run.result;
-            terminalGit = run.git;
-            sawResult = isTerminalRunStatus(run.status);
-            streamDone = true;
-            break;
-          }
-        }
-        if (!streamDone) {
-          const run = await this.waitForRunTerminal(agentId, runId);
-          terminalText = run.result;
-          terminalGit = run.git;
-          sawResult = isTerminalRunStatus(run.status);
-        }
-      }
-
-      await flushThinking(true);
-      await flushAssistant(true);
-
-      if (!sawResult) {
-        const run = await this.waitForRunTerminal(agentId, runId);
-        terminalText = run.result ?? terminalText;
-        terminalGit = run.git ?? terminalGit;
-      }
-
-      const prUrls =
-        terminalGit?.branches
-          ?.map((b) => b.prUrl)
-          .filter((u): u is string => Boolean(u)) ?? [];
-
-      await this.workEnd(target);
-
-      if (!assistantSent && terminalText?.trim()) {
-        await this.sendOut(target, terminalText.trim());
-      }
-
-      await this.sendOut(
-        target,
-        formatDoneFooter(agentUrl, prUrls, assistantSent),
-      );
-    } catch (err) {
-      await this.workEnd(target);
-      const message = err instanceof Error ? err.message : String(err);
-      await this.sendOut(target, `❌ Stream failed: ${message}`);
-    } finally {
-      this.streams.clear(agentId, runId);
-    }
-  }
-
-  /** Wait until run leaves CREATING (stream may 409 if opened too early). */
-  private async waitForRunActive(agentId: string, runId: string): Promise<Run> {
-    const started = Date.now();
-    let last = await this.cursor.getRun(agentId, runId);
-    while (
-      last.status === "CREATING" &&
-      Date.now() - started < RUN_CREATING_WAIT_MS
-    ) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-      last = await this.cursor.getRun(agentId, runId);
-    }
-    return last;
-  }
-
-  /** Poll getRun until terminal or timeout (used when SSE is gone). */
-  private async waitForRunTerminal(agentId: string, runId: string): Promise<Run> {
-    const started = Date.now();
-    let last: Run | undefined;
-    while (Date.now() - started < POLL_MAX_MS) {
-      last = await this.cursor.getRun(agentId, runId);
-      if (isTerminalRunStatus(last.status)) return last;
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
-    }
-    if (last) return last;
-    return this.cursor.getRun(agentId, runId);
-  }
 
   /** Wait until latest run is terminal (or none active). */
   private async waitUntilAgentIdle(agentId: string): Promise<void> {

@@ -20,4 +20,9 @@ export class ActiveStreamTracker {
   isStreaming(agentId: string, runId: string): boolean {
     return this.map.get(agentId) === runId;
   }
+
+  /** Drop streaming claim for an agent (e.g. /new or agent deleted). */
+  clearAgent(agentId: string): void {
+    this.map.delete(agentId);
+  }
 }

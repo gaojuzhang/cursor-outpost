@@ -1,7 +1,8 @@
 # Copy to ~/.config/cursor-outpost/config.yaml
+# Topic 绑定：/repos + /bind（不依赖下方列表）。私聊用 default 项。
 projects:
-  - slug: demo
-    repo_url: https://github.com/you/repo
+  - slug: flux
+    repo_url: https://github.com/you/fluxalpha
     ref: main
     default: true
 
@@ -10,3 +11,11 @@ telegram:
 
 poller:
   interval_ms: 8000
+
+# Cloud agent list cache (SDK Agent.list) for /resume
+agent_catalog:
+  interval_ms: 300000
+
+# Cursor-connected GitHub repos cache for /repos (API rate limit: ~1/min)
+repo_catalog:
+  interval_ms: 180000
