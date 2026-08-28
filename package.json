@@ -12,10 +12,11 @@
     "dev": "tsx src/index.ts"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.13"
   },
   "license": "MIT",
   "dependencies": {
+    "@cursor/sdk": "^1.0.30",
     "grammy": "^1.45.1",
     "yaml": "^2.8.0"
   },

@@ -42,7 +42,7 @@ async function main(): Promise<void> {
     apiBase: config.apiBase,
   });
 
-  console.log("outpost: probing Cursor Cloud Agents API…");
+  console.log("outpost: Cursor backend = @cursor/sdk");
   await client.probe();
   console.log("outpost: Cursor API probe ok");
 

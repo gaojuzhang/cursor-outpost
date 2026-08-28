@@ -1,68 +1,39 @@
 /**
- * Cursor Cloud Agents HTTP client (fetch only).
- * @see https://cursor.com/docs/cloud-agent/api/endpoints
+ * Cursor Cloud Agents client via @cursor/sdk (public beta).
+ * Keeps the Outpost-facing API used by router/poller.
  */
 
+import {
+  Agent as SdkAgentClass,
+  AgentBusyError,
+  Cursor,
+  CursorAgentError,
+  type Run as SdkRun,
+  type SDKAgent,
+  type SDKUserMessage,
+} from "@cursor/sdk";
 import type {
   Agent,
   Conversation,
-  CreateAgentRequest,
   CreateAgentResponse,
-  CreateRunRequest,
   CreateRunResponse,
   ListResult,
   PromptImage,
   Run,
-  RunStatus,
   StreamEvent,
 } from "./types.js";
+import {
+  agentUrl,
+  mapSdkAgentInfo,
+  mapSdkMessage,
+  mapSdkRun,
+  resultEventFromRun,
+} from "./sdk-map.js";
 
 export type CursorClientOptions = {
   apiKey: string;
   apiBase?: string;
 };
-
-const FETCH_RETRY_ATTEMPTS = 3;
-const FETCH_RETRY_DELAY_MS = 600;
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function networkCause(err: unknown): string | undefined {
-  if (!(err instanceof Error)) return undefined;
-  const c = err.cause;
-  if (c instanceof Error) return c.message;
-  if (c && typeof c === "object" && "code" in c) {
-    return String((c as { code: unknown }).code);
-  }
-  return undefined;
-}
-
-/** Human-readable network failure (fetch threw before HTTP response). */
-export function formatCursorFetchError(url: string, err: unknown): string {
-  if (err instanceof CursorApiError) return err.message;
-  const msg = err instanceof Error ? err.message : String(err);
-  const cause = networkCause(err);
-  return `Cursor network error ${url}: ${msg}${cause ? ` (${cause})` : ""}`;
-}
-
-async function fetchWithRetry(url: string, opts: RequestInit): Promise<Response> {
-  let last: unknown;
-  for (let attempt = 0; attempt < FETCH_RETRY_ATTEMPTS; attempt++) {
-    try {
-      return await fetch(url, opts);
-    } catch (err) {
-      last = err;
-      if (attempt + 1 < FETCH_RETRY_ATTEMPTS) {
-        await sleep(FETCH_RETRY_DELAY_MS * (attempt + 1));
-      }
-    }
-  }
-  const wrapped = new Error(formatCursorFetchError(url, last));
-  wrapped.cause = last;
-  throw wrapped;
-}
 
 export class CursorApiError extends Error {
   readonly status: number;
@@ -79,23 +50,6 @@ export class CursorApiError extends Error {
   }
 }
 
-/** Official shape is often `{ error: { code, message } }`. */
-function parseApiErrorCode(body: string): string | undefined {
-  try {
-    const parsed = JSON.parse(body) as {
-      error?: string | { code?: string; message?: string };
-      code?: string;
-    };
-    if (typeof parsed.error === "object" && parsed.error?.code) {
-      return parsed.error.code;
-    }
-    if (typeof parsed.error === "string") return parsed.error;
-    return parsed.code;
-  } catch {
-    return undefined;
-  }
-}
-
 /** Stream retention gone — caller should fall back to getRun. */
 export function isStreamGoneError(err: unknown): err is CursorApiError {
   if (!(err instanceof CursorApiError)) return false;
@@ -108,55 +62,84 @@ export function isStreamGoneCode(code: string | undefined): boolean {
   return code === "stream_expired" || code === "stream_unavailable";
 }
 
+/** @deprecated SDK path — kept for callers that format fetch errors. */
+export function formatCursorFetchError(url: string, err: unknown): string {
+  if (err instanceof CursorApiError) return err.message;
+  const msg = err instanceof Error ? err.message : String(err);
+  return `Cursor network error ${url}: ${msg}`;
+}
+
+function toUserMessage(
+  text: string,
+  images?: PromptImage[],
+): string | SDKUserMessage {
+  if (!images?.length) return text;
+  return {
+    text,
+    images: images.map((img) => ({
+      data: img.data,
+      mimeType: img.mimeType,
+      dimension: img.dimension,
+    })),
+  };
+}
+
+function wrapSdkError(err: unknown): CursorApiError {
+  if (err instanceof CursorApiError) return err;
+  if (err instanceof AgentBusyError) {
+    return new CursorApiError(409, err.message, err.code ?? "agent_busy");
+  }
+  if (err instanceof CursorAgentError) {
+    const status = err.status ?? 500;
+    return new CursorApiError(status, err.message, err.code);
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return new CursorApiError(500, msg);
+}
+
 export class CursorClient {
   private readonly apiKey: string;
   private readonly apiBase: string;
-
-  /** Vision model for prompts that include images. */
-  static readonly IMAGE_MODEL_ID = "composer-2.5";
+  private readonly agentHandles = new Map<string, SDKAgent>();
+  private readonly runHandles = new Map<string, SdkRun>();
 
   constructor(opts: CursorClientOptions) {
     this.apiKey = opts.apiKey;
     this.apiBase = (opts.apiBase ?? "https://api.cursor.com/v1").replace(/\/$/, "");
   }
 
-  private authHeaders(extra?: HeadersInit): Headers {
-    const headers = new Headers(extra);
-    headers.set("Authorization", `Bearer ${this.apiKey}`);
-    if (!headers.has("Accept")) {
-      headers.set("Accept", "application/json");
-    }
-    return headers;
+  private cloudOpts() {
+    return { apiKey: this.apiKey };
   }
 
-  private async requestJson<T>(
-    method: string,
-    path: string,
-    body?: unknown,
-  ): Promise<T> {
-    const headers = this.authHeaders();
-    if (body !== undefined) {
-      headers.set("Content-Type", "application/json");
-    }
-    const url = `${this.apiBase}${path}`;
-    const res = await fetchWithRetry(url, {
-      method,
-      headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+  private async resumeAgent(agentId: string): Promise<SDKAgent> {
+    const cached = this.agentHandles.get(agentId);
+    if (cached) return cached;
+    const handle = await SdkAgentClass.resume(agentId, this.cloudOpts());
+    this.agentHandles.set(agentId, handle);
+    return handle;
+  }
+
+  private cacheRun(run: SdkRun): SdkRun {
+    this.runHandles.set(run.id, run);
+    return run;
+  }
+
+  private async fetchRun(agentId: string, runId: string): Promise<SdkRun> {
+    const cached = this.runHandles.get(runId);
+    if (cached && cached.agentId === agentId) return cached;
+    const run = await SdkAgentClass.getRun(runId, {
+      runtime: "cloud",
+      agentId,
+      apiKey: this.apiKey,
     });
-    const text = await res.text().catch(() => "");
-    if (!res.ok) {
-      throw new CursorApiError(res.status, text, parseApiErrorCode(text));
-    }
-    if (!text) {
-      return undefined as T;
-    }
-    return JSON.parse(text) as T;
+    return this.cacheRun(run);
   }
 
-  /** Read-only probe: list agents with limit=1. */
+  /** Read-only probe: account + list agents. */
   async probe(): Promise<void> {
-    await this.listAgents({ limit: 1 });
+    await Cursor.me(this.cloudOpts());
+    await SdkAgentClass.list({ runtime: "cloud", limit: 1, ...this.cloudOpts() });
   }
 
   async listAgents(params?: {
@@ -164,22 +147,24 @@ export class CursorClient {
     cursor?: string;
     includeArchived?: boolean;
   }): Promise<ListResult<Agent>> {
-    const q = new URLSearchParams();
-    if (params?.limit != null) q.set("limit", String(params.limit));
-    if (params?.cursor) q.set("cursor", params.cursor);
-    if (params?.includeArchived) q.set("includeArchived", "true");
-    const qs = q.toString();
-    return this.requestJson("GET", `/agents${qs ? `?${qs}` : ""}`);
+    const listed = await SdkAgentClass.list({
+      runtime: "cloud",
+      limit: params?.limit,
+      cursor: params?.cursor,
+      includeArchived: params?.includeArchived,
+      ...this.cloudOpts(),
+    });
+    return {
+      items: listed.items.map(mapSdkAgentInfo),
+      nextCursor: listed.nextCursor,
+    };
   }
 
   async getAgent(agentId: string): Promise<Agent> {
-    return this.requestJson("GET", `/agents/${encodeURIComponent(agentId)}`);
+    const info = await SdkAgentClass.get(agentId, this.cloudOpts());
+    return mapSdkAgentInfo(info);
   }
 
-  /**
-   * Create agent + initial run.
-   * Always sends autoCreatePR: false; never sends workOnCurrentBranch or env.
-   */
   async createAgent(input: {
     text: string;
     repoUrl: string;
@@ -187,13 +172,41 @@ export class CursorClient {
     name?: string;
     images?: PromptImage[];
   }): Promise<CreateAgentResponse> {
-    if (input.images?.length) {
-      const body = buildCreateAgentBody(input);
-      console.log(
-        `outpost: cursor createAgent images=${input.images.length} model=${body.model?.id} mime=${input.images[0]?.mimeType} jsonBytes~${JSON.stringify(body).length}`,
-      );
+    try {
+      const handle = await SdkAgentClass.create({
+        ...this.cloudOpts(),
+        name: input.name,
+        cloud: {
+          repos: [
+            {
+              url: input.repoUrl,
+              startingRef: input.startingRef,
+            },
+          ],
+          autoCreatePR: false,
+        },
+      });
+      this.agentHandles.set(handle.agentId, handle);
+      const run = await handle.send(toUserMessage(input.text, input.images));
+      this.cacheRun(run);
+      if (input.images?.length) {
+        console.log(
+          `outpost: sdk createAgent images=${input.images.length} model=${handle.model?.id ?? "inherit"} mime=${input.images[0]?.mimeType}`,
+        );
+      }
+      return {
+        agent: {
+          id: handle.agentId,
+          status: "ACTIVE",
+          url: agentUrl(handle.agentId),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        },
+        run: mapSdkRun(run),
+      };
+    } catch (err) {
+      throw wrapSdkError(err);
     }
-    return this.requestJson("POST", "/agents", buildCreateAgentBody(input));
   }
 
   async createRun(
@@ -201,269 +214,142 @@ export class CursorClient {
     text: string,
     images?: PromptImage[],
   ): Promise<CreateRunResponse> {
-    const body: CreateRunRequest = {
-      prompt: images?.length ? { text, images } : { text },
-    };
-    if (images?.length) {
-      body.model = { id: CursorClient.IMAGE_MODEL_ID };
-      console.log(
-        `outpost: cursor createRun images=${images.length} model=${body.model.id} mime=${images[0]?.mimeType} jsonBytes~${JSON.stringify(body).length}`,
-      );
+    try {
+      const handle = await this.resumeAgent(agentId);
+      const run = await handle.send(toUserMessage(text, images));
+      this.cacheRun(run);
+      if (images?.length) {
+        console.log(
+          `outpost: sdk createRun images=${images.length} model=${handle.model?.id ?? "inherit"} mime=${images[0]?.mimeType}`,
+        );
+      }
+      return { run: mapSdkRun(run) };
+    } catch (err) {
+      throw wrapSdkError(err);
     }
-    return this.requestJson(
-      "POST",
-      `/agents/${encodeURIComponent(agentId)}/runs`,
-      body,
-    );
   }
 
   async listRuns(
     agentId: string,
     params?: { limit?: number; cursor?: string },
   ): Promise<ListResult<Run>> {
-    const q = new URLSearchParams();
-    if (params?.limit != null) q.set("limit", String(params.limit));
-    if (params?.cursor) q.set("cursor", params.cursor);
-    const qs = q.toString();
-    return this.requestJson(
-      "GET",
-      `/agents/${encodeURIComponent(agentId)}/runs${qs ? `?${qs}` : ""}`,
-    );
+    const listed = await SdkAgentClass.listRuns(agentId, {
+      runtime: "cloud",
+      limit: params?.limit,
+      cursor: params?.cursor,
+      ...this.cloudOpts(),
+    });
+    return {
+      items: listed.items.map(mapSdkRun),
+      nextCursor: listed.nextCursor,
+    };
   }
 
   async getRun(agentId: string, runId: string): Promise<Run> {
-    return this.requestJson(
-      "GET",
-      `/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}`,
-    );
+    try {
+      const run = await this.fetchRun(agentId, runId);
+      return mapSdkRun(run);
+    } catch (err) {
+      throw wrapSdkError(err);
+    }
   }
 
   async cancelRun(agentId: string, runId: string): Promise<{ id: string }> {
-    return this.requestJson(
-      "POST",
-      `/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}/cancel`,
-    );
+    try {
+      await SdkAgentClass.cancelRun(runId, {
+        runtime: "cloud",
+        agentId,
+        apiKey: this.apiKey,
+      });
+      return { id: runId };
+    } catch (err) {
+      throw wrapSdkError(err);
+    }
   }
 
   /**
    * User prompts are not on v1 getRun. Legacy v0 conversation still returns them.
-   * @see https://cursor.com/docs/cloud-agent/api/v0
    */
   async getConversation(agentId: string): Promise<Conversation> {
     const v0Base = this.apiBase.replace(/\/v1\/?$/, "/v0");
     const url = `${v0Base}/agents/${encodeURIComponent(agentId)}/conversation`;
-    const res = await fetchWithRetry(url, {
+    const res = await fetch(url, {
       method: "GET",
-      headers: this.authHeaders(),
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        Accept: "application/json",
+      },
     });
     const text = await res.text().catch(() => "");
     if (!res.ok) {
-      throw new CursorApiError(res.status, text, parseApiErrorCode(text));
+      throw new CursorApiError(res.status, text);
     }
     return JSON.parse(text) as Conversation;
   }
 
-  /**
-   * Stream SSE for one run. Yields simplified events; ignores interaction_update.
-   * On 410 / 409 stream_unavailable, throws CursorApiError — caller should getRun.
-   */
   async *streamRun(
     agentId: string,
     runId: string,
-    opts?: { lastEventId?: string; signal?: AbortSignal },
+    _opts?: { lastEventId?: string; signal?: AbortSignal },
   ): AsyncGenerator<StreamEvent, void, undefined> {
-    const headers = this.authHeaders({ Accept: "text/event-stream" });
-    if (opts?.lastEventId) {
-      headers.set("Last-Event-ID", opts.lastEventId);
+    let run: SdkRun;
+    try {
+      run = await this.fetchRun(agentId, runId);
+    } catch (err) {
+      throw wrapSdkError(err);
     }
 
-    const streamUrl = `${this.apiBase}/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}/stream`;
-    const res = await fetchWithRetry(streamUrl, {
-      method: "GET",
-      headers,
-      signal: opts?.signal,
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new CursorApiError(res.status, text, parseApiErrorCode(text));
+    if (!run.supports("stream")) {
+      const reason = run.unsupportedReason("stream") ?? "stream_unavailable";
+      throw new CursorApiError(409, reason, "stream_unavailable");
     }
 
-    if (!res.body) {
-      throw new CursorApiError(res.status, "empty stream body");
-    }
+    try {
+      for await (const msg of run.stream()) {
+        const ev = mapSdkMessage(msg);
+        if (ev) yield ev;
+      }
 
-    yield* parseSseStream(res.body);
+      let finalRun = run;
+      if (run.supports("wait")) {
+        try {
+          const waited = await run.wait();
+          finalRun = {
+            ...run,
+            status: waited.status,
+            result: waited.result ?? run.result,
+            durationMs: waited.durationMs ?? run.durationMs,
+            git: waited.git ?? run.git,
+            model: waited.model ?? run.model,
+          };
+          this.cacheRun(finalRun);
+        } catch {
+          finalRun = await this.fetchRun(agentId, runId);
+        }
+      } else {
+        finalRun = await this.fetchRun(agentId, runId);
+      }
+
+      yield resultEventFromRun(finalRun);
+      yield { type: "done", data: {} };
+    } catch (err) {
+      throw wrapSdkError(err);
+    }
+  }
+
+  /** Current model on an in-memory SDK handle (undefined after resume-only). */
+  getCachedAgentModel(agentId: string): string | undefined {
+    return this.agentHandles.get(agentId)?.model?.id;
   }
 }
 
-/** Exported for step-3 field checks; not a public product API. */
-export function buildCreateAgentBody(input: {
+/** @deprecated REST helper — unused under SDK backend. */
+export function buildCreateAgentBody(_input: {
   text: string;
   repoUrl: string;
   startingRef: string;
   name?: string;
   images?: PromptImage[];
-}): CreateAgentRequest {
-  const prompt =
-    input.images?.length
-      ? { text: input.text, images: input.images }
-      : { text: input.text };
-  const body: CreateAgentRequest = {
-    prompt,
-    repos: [{ url: input.repoUrl, startingRef: input.startingRef }],
-    autoCreatePR: false,
-  };
-  if (input.images?.length) {
-    body.model = { id: CursorClient.IMAGE_MODEL_ID };
-  }
-  if (input.name) {
-    body.name = input.name;
-  }
-  return body;
-}
-
-async function* parseSseStream(
-  body: ReadableStream<Uint8Array>,
-): AsyncGenerator<StreamEvent, void, undefined> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let eventName = "message";
-  let eventId: string | undefined;
-  let dataLines: string[] = [];
-
-  const flush = (): StreamEvent | undefined => {
-    if (dataLines.length === 0 && eventId === undefined) {
-      eventName = "message";
-      return undefined;
-    }
-    const raw = dataLines.join("\n");
-    dataLines = [];
-    const id = eventId;
-    eventId = undefined;
-    const name = eventName;
-    eventName = "message";
-
-    if (name === "interaction_update") {
-      return undefined;
-    }
-
-    let data: unknown = {};
-    if (raw) {
-      try {
-        data = JSON.parse(raw) as unknown;
-      } catch {
-        data = { raw };
-      }
-    }
-
-    return toStreamEvent(name, data, id);
-  };
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let nl: number;
-      while ((nl = buffer.indexOf("\n")) >= 0) {
-        let line = buffer.slice(0, nl);
-        buffer = buffer.slice(nl + 1);
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-
-        if (line === "") {
-          const ev = flush();
-          if (ev) yield ev;
-          continue;
-        }
-        if (line.startsWith(":")) continue;
-
-        const colon = line.indexOf(":");
-        const field = colon === -1 ? line : line.slice(0, colon);
-        let valuePart = colon === -1 ? "" : line.slice(colon + 1);
-        if (valuePart.startsWith(" ")) valuePart = valuePart.slice(1);
-
-        if (field === "event") {
-          eventName = valuePart;
-        } else if (field === "data") {
-          dataLines.push(valuePart);
-        } else if (field === "id") {
-          eventId = valuePart;
-        }
-      }
-    }
-    decoder.decode();
-    const last = flush();
-    if (last) yield last;
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-function toStreamEvent(
-  name: string,
-  data: unknown,
-  id?: string,
-): StreamEvent {
-  const obj = (data ?? {}) as Record<string, unknown>;
-  switch (name) {
-    case "status":
-      return {
-        type: "status",
-        id,
-        data: {
-          runId: String(obj.runId ?? ""),
-          status: obj.status as RunStatus,
-        },
-      };
-    case "assistant":
-      return { type: "assistant", id, data: { text: String(obj.text ?? "") } };
-    case "thinking":
-      return { type: "thinking", id, data: { text: String(obj.text ?? "") } };
-    case "tool_call":
-      return {
-        type: "tool_call",
-        id,
-        data: {
-          callId: String(obj.callId ?? ""),
-          name: String(obj.name ?? ""),
-          status: obj.status as "running" | "completed",
-          args: obj.args,
-          result: obj.result,
-          truncated: obj.truncated as
-            | { args?: true; result?: true }
-            | undefined,
-        },
-      };
-    case "result":
-      return {
-        type: "result",
-        id,
-        data: {
-          runId: String(obj.runId ?? ""),
-          status: obj.status as RunStatus,
-          text: obj.text != null ? String(obj.text) : undefined,
-          durationMs:
-            typeof obj.durationMs === "number" ? obj.durationMs : undefined,
-          git: obj.git as Run["git"],
-        },
-      };
-    case "error":
-      return {
-        type: "error",
-        id,
-        data: {
-          code: String(obj.code ?? "error"),
-          message: String(obj.message ?? ""),
-        },
-      };
-    case "done":
-      return { type: "done", id, data: {} };
-    case "heartbeat":
-      return { type: "heartbeat", id, data: obj };
-    default:
-      return { type: "unknown", id, event: name, data };
-  }
+}): never {
+  throw new Error("buildCreateAgentBody is not used with @cursor/sdk backend");
 }
