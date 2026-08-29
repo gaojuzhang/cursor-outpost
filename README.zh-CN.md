@@ -81,6 +81,50 @@ npm start
 npm run dev
 ```
 
+### 5. 后台运行（关闭终端不退出）
+
+在终端里直接 `npm start` 时，**关闭终端或断开 SSH 会结束进程**。需要常驻请用：
+
+**方式 A — `nohup`（无需额外安装）**
+
+```bash
+cd cursor-outpost
+npm run build
+nohup npm start >> ~/.config/cursor-outpost/outpost.log 2>&1 &
+echo $! > ~/.config/cursor-outpost/outpost.pid
+```
+
+- 看日志：`tail -f ~/.config/cursor-outpost/outpost.log`
+- 停止：`kill $(cat ~/.config/cursor-outpost/outpost.pid)`
+
+**方式 B — [pm2](https://pm2.keymetrics.io/)（崩溃可自动拉起）**
+
+先安装（若提示 `pm2: command not found`）：
+
+```bash
+npm install -g pm2
+```
+
+然后：
+
+```bash
+npm run build
+pm2 start dist/index.js --name cursor-outpost
+pm2 save          # 可选：重启后恢复
+pm2 startup       # 可选：开机自启（Linux/macOS）
+```
+
+不想全局安装时，用 `npx pm2 start dist/index.js --name cursor-outpost` 代替 `pm2`。
+
+- 看日志：`pm2 logs cursor-outpost`（或 `npx pm2 logs …`）
+- 停止：`pm2 stop cursor-outpost`
+
+**方式 C — systemd（Linux 服务器）**
+
+`npm run build` 后，用 `ExecStart=/usr/bin/node /path/to/cursor-outpost/dist/index.js`，`WorkingDirectory` 指向仓库目录。密钥可通过 `EnvironmentFile=~/.config/cursor-outpost/.env` 注入（systemd 格式：每行 `KEY=value`）。
+
+长期运行建议用 **pm2** 或 **systemd**，不要依赖一直开着 SSH。
+
 ---
 
 ## 安全与密钥

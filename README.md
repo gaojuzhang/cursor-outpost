@@ -81,6 +81,50 @@ Development:
 npm run dev
 ```
 
+### 5. Run in the background
+
+Closing the terminal (or ending an SSH session) **stops** a foreground `npm start`. To keep outpost running:
+
+**Option A — `nohup` (no extra install)**
+
+```bash
+cd cursor-outpost
+npm run build
+nohup npm start >> ~/.config/cursor-outpost/outpost.log 2>&1 &
+echo $! > ~/.config/cursor-outpost/outpost.pid
+```
+
+- Logs: `tail -f ~/.config/cursor-outpost/outpost.log`
+- Stop: `kill $(cat ~/.config/cursor-outpost/outpost.pid)`
+
+**Option B — [pm2](https://pm2.keymetrics.io/) (auto-restart on crash)**
+
+Install once (if `pm2: command not found`):
+
+```bash
+npm install -g pm2
+```
+
+Then:
+
+```bash
+npm run build
+pm2 start dist/index.js --name cursor-outpost
+pm2 save          # optional: restore after reboot
+pm2 startup       # optional: generate boot hook (Linux/macOS)
+```
+
+Without a global install, use `npx pm2 start dist/index.js --name cursor-outpost` instead of `pm2`.
+
+- Logs: `pm2 logs cursor-outpost` (or `npx pm2 logs cursor-outpost`)
+- Stop: `pm2 stop cursor-outpost`
+
+**Option C — systemd (Linux server)**
+
+Run as your user after `npm run build`, with `ExecStart=/usr/bin/node /path/to/cursor-outpost/dist/index.js` and `WorkingDirectory` set to the repo. Ensure `CURSOR_API_KEY` etc. are in the unit file or loaded via `EnvironmentFile=~/.config/cursor-outpost/.env` (systemd format: `KEY=value` per line).
+
+For long-running use, prefer **pm2** or **systemd** over leaving an SSH session open.
+
 ---
 
 ## Security and secrets

@@ -1,5 +1,5 @@
 # Copy to ~/.config/cursor-outpost/config.yaml
-# Topic 绑定：/repos + /bind（不依赖下方列表）。私聊用 default 项。
+# Topic binding: /repos + /bind (group Topics). Private chat uses the default project below.
 projects:
   - slug: flux
     repo_url: https://github.com/you/fluxalpha
