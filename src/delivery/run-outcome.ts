@@ -1,5 +1,5 @@
 import type { ObservedTokenUsage } from "../core/context-observe.js";
-import type { Run } from "../cursor/types.js";
+import type { Run, RunStatus } from "../cursor/types.js";
 
 export type RunBodySource =
   | "stream"
@@ -12,6 +12,7 @@ export type RunBodySource =
 export type RunOutcome = {
   body: string;
   bodySource: RunBodySource;
+  runStatus?: RunStatus;
   git?: Run["git"];
   usage?: ObservedTokenUsage;
   compacted?: boolean;

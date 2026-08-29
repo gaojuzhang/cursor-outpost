@@ -191,7 +191,7 @@ export class RunSession {
     try {
       await this.presenter.beginWork(target);
 
-      const preflight = await this.cursor.waitForRunActive(agentId, runId);
+      const preflight = await this.cursor.waitForRunDeliverable(agentId, runId);
       const skipStream = isTerminalRunStatus(preflight.status);
 
       if (skipStream) {
@@ -199,6 +199,10 @@ export class RunSession {
           `outpost: run already ${preflight.status} before stream — resolve-only path`,
         );
         gitHint = preflight.git ?? gitHint;
+        if (preflight.result?.trim()) {
+          assistantBuf += preflight.result;
+          await flushAssistant(true);
+        }
       } else {
         let streamDone = false;
         for (let attempt = 0; attempt < STREAM_OPEN_ATTEMPTS; attempt++) {
@@ -288,6 +292,7 @@ export class RunSession {
         agentUrl,
         prUrls,
         bodyStreamed,
+        outcome.runStatus,
       );
 
       console.log(

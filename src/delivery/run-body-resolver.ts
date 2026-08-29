@@ -4,9 +4,10 @@ import {
   lastAssistantText,
 } from "../core/conversation-text.js";
 import type { ObservedTokenUsage } from "../core/context-observe.js";
-import type { CursorClient } from "../cursor/client.js";
+import { isStaleTerminalSnapshot, type CursorClient } from "../cursor/client.js";
+import { mapSdkRunStatus } from "../cursor/sdk-map.js";
 import { formatRunBodyUnavailable } from "../channels/telegram/format.js";
-import type { Run } from "../cursor/types.js";
+import type { Run, RunStatus } from "../cursor/types.js";
 import type { RunBodySource, RunOutcome } from "./run-outcome.js";
 
 const RESOLVE_DEADLINE_MS = 20_000;
@@ -41,7 +42,13 @@ export class RunBodyResolver {
   async resolve(input: ResolveRunBodyInput): Promise<RunOutcome> {
     const streamBody = input.streamBuffer.trim();
     if (streamBody) {
-      return this.outcome(streamBody, "stream", input.gitHint, input.usageHint);
+      return this.outcome(
+        streamBody,
+        "stream",
+        input.gitHint,
+        input.usageHint,
+        "FINISHED",
+      );
     }
 
     const started = Date.now();
@@ -61,7 +68,13 @@ export class RunBodyResolver {
         console.log(
           `outpost: run body from run.result agent=${input.agentId} run=${input.runId}`,
         );
-        return this.outcome(snap.result.trim(), "run", lastGit, lastUsage);
+        return this.outcome(
+          snap.result.trim(),
+          "run",
+          lastGit,
+          lastUsage,
+          mapSdkRunStatus(snap.status),
+        );
       }
 
       const runConv = await this.cursor.getRunConversationText(
@@ -72,16 +85,29 @@ export class RunBodyResolver {
         console.log(
           `outpost: run body from run.conversation agent=${input.agentId} run=${input.runId}`,
         );
-        return this.outcome(runConv, "run_conversation", lastGit, lastUsage);
+        return this.outcome(
+          runConv,
+          "run_conversation",
+          lastGit,
+          lastUsage,
+          mapSdkRunStatus(snap.status),
+        );
       }
 
       const v0 = await this.resolveV0Conversation(input.agentId, input.runId);
       if (v0) {
-        return this.outcome(v0.text, "conversation", lastGit, lastUsage);
+        return this.outcome(
+          v0.text,
+          "conversation",
+          lastGit,
+          lastUsage,
+          mapSdkRunStatus(snap.status),
+        );
       }
 
       if (
         snap.isTerminal &&
+        !isStaleTerminalSnapshot(snap) &&
         Date.now() - started >= TERMINAL_MIN_WAIT_MS
       ) {
         break;
@@ -95,7 +121,13 @@ export class RunBodyResolver {
       waitMaxMs: 15_000,
     });
     if (snap.result?.trim()) {
-      return this.outcome(snap.result.trim(), "run", snap.git ?? lastGit, snap.usage ?? lastUsage);
+      return this.outcome(
+        snap.result.trim(),
+        "run",
+        snap.git ?? lastGit,
+        snap.usage ?? lastUsage,
+        mapSdkRunStatus(snap.status),
+      );
     }
 
     const runConv = await this.cursor.getRunConversationText(
@@ -103,14 +135,27 @@ export class RunBodyResolver {
       input.runId,
     );
     if (runConv) {
-      return this.outcome(runConv, "run_conversation", snap.git ?? lastGit, snap.usage ?? lastUsage);
+      return this.outcome(
+        runConv,
+        "run_conversation",
+        snap.git ?? lastGit,
+        snap.usage ?? lastUsage,
+        mapSdkRunStatus(snap.status),
+      );
     }
 
     const v0 = await this.resolveV0Conversation(input.agentId, input.runId);
     if (v0) {
-      return this.outcome(v0.text, "conversation", snap.git ?? lastGit, snap.usage ?? lastUsage);
+      return this.outcome(
+        v0.text,
+        "conversation",
+        snap.git ?? lastGit,
+        snap.usage ?? lastUsage,
+        mapSdkRunStatus(snap.status),
+      );
     }
 
+    const runStatus = mapSdkRunStatus(snap.status);
     console.warn(
       `outpost: run body unresolved agent=${input.agentId} run=${input.runId} status=${snap.status}`,
     );
@@ -119,6 +164,7 @@ export class RunBodyResolver {
       "none",
       snap.git ?? lastGit,
       snap.usage ?? lastUsage,
+      runStatus,
     );
   }
 
@@ -127,8 +173,9 @@ export class RunBodyResolver {
     bodySource: RunBodySource,
     git?: Run["git"],
     usage?: ObservedTokenUsage,
+    runStatus?: RunStatus,
   ): RunOutcome {
-    return { body, bodySource, git, usage };
+    return { body, bodySource, git, usage, runStatus };
   }
 
   private async resolveV0Conversation(
@@ -149,7 +196,11 @@ export class RunBodyResolver {
           `matched=${Boolean(matched)} lastUser=${Boolean(afterLastUser && !matched)}`,
       );
       return { text, matched: Boolean(matched) };
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `outpost: v0 conversation fetch failed agent=${agentId} run=${runId}: ${msg}`,
+      );
       return undefined;
     }
   }

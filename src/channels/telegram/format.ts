@@ -115,17 +115,36 @@ export function formatDoneTail(agentUrl: string, prUrls: string[]): string {
   return lines.join("\n");
 }
 
+/** Tail line icon + label from run status (Done vs Error, etc.). */
+export function formatRunTailLabel(runStatus?: string): { icon: string; label: string } {
+  const raw = (runStatus ?? "FINISHED").trim().toUpperCase();
+  const failed = isFailureRunStatus(raw);
+  const icon = failed ? "❌" : "✅";
+  const label = RUN_STATUS_LABEL[raw] ?? raw;
+  return { icon, label };
+}
+
 /** Done + links appended to the last assistant message body. */
-export function formatContentDoneTail(agentUrl: string, prUrls: string[]): string {
-  return `${MESSAGE_TAIL_SEP}${formatDoneTail(agentUrl, prUrls)}`;
+export function formatContentDoneTail(
+  agentUrl: string,
+  prUrls: string[],
+  runStatus?: string,
+): string {
+  const { icon, label } = formatRunTailLabel(runStatus);
+  const lines: string[] = [`${icon} ${label}`];
+  if (agentUrl) lines.push(agentUrl);
+  for (const u of prUrls) lines.push(u);
+  return `${MESSAGE_TAIL_SEP}${lines.join("\n")}`;
 }
 
 /** HTML variant for parse_mode=HTML assistant messages. */
 export function formatContentDoneTailHtml(
   agentUrl: string,
   prUrls: string[],
+  runStatus?: string,
 ): string {
-  const lines = ["✅ Done"];
+  const { icon, label } = formatRunTailLabel(runStatus);
+  const lines = [`${icon} ${label}`];
   if (agentUrl) {
     lines.push(
       `<a href="${escapeTelegramHtml(agentUrl)}">${escapeTelegramHtml(agentUrl)}</a>`,

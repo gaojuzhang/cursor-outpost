@@ -73,10 +73,13 @@ export class TelegramRunPresenter {
     agentUrl: string,
     prUrls: string[],
     bodyAlreadyStreamed: boolean,
+    runStatus?: string,
   ): Promise<void> {
     const text = body.trim() || formatRunBodyUnavailable();
     const htmlBody = this.htmlBody(text);
-    const doneTail = formatContentDoneTailHtml(agentUrl, prUrls);
+    const tailStatus =
+      text !== formatRunBodyUnavailable() ? "FINISHED" : runStatus;
+    const doneTail = formatContentDoneTailHtml(agentUrl, prUrls, tailStatus);
     const sendOpts = this.htmlOpts();
 
     if (!bodyAlreadyStreamed) {

@@ -169,6 +169,18 @@ function isSdkRunRunning(status: string): boolean {
   return mapSdkRunStatus(status) === "RUNNING";
 }
 
+/** Terminal run with no result — often a stale handle right after send() on first create. */
+function isStaleTerminalRun(run: SdkRun): boolean {
+  const mapped = mapSdkRunStatus(run.status);
+  if (!isTerminalRunStatus(mapped)) return false;
+  return !run.result?.trim();
+}
+
+export function isStaleTerminalSnapshot(snap: RunTerminalSnapshot): boolean {
+  if (!snap.isTerminal) return false;
+  return !snap.result?.trim();
+}
+
 export type RunTerminalSnapshot = {
   status: string;
   result?: string;
@@ -236,11 +248,23 @@ export class CursorClient {
     return run;
   }
 
-  private async fetchRun(agentId: string, runId: string): Promise<SdkRun> {
-    const cached = this.runHandles.get(runId);
-    if (cached && cached.agentId === agentId) {
-      if (hasRunCapabilities(cached)) return cached;
-      this.runHandles.delete(runId);
+  private invalidateRunCache(runId: string): void {
+    this.runHandles.delete(runId);
+  }
+
+  private async fetchRun(
+    agentId: string,
+    runId: string,
+    opts?: { force?: boolean },
+  ): Promise<SdkRun> {
+    if (opts?.force) {
+      this.invalidateRunCache(runId);
+    } else {
+      const cached = this.runHandles.get(runId);
+      if (cached && cached.agentId === agentId && hasRunCapabilities(cached)) {
+        if (!isStaleTerminalRun(cached)) return cached;
+        this.invalidateRunCache(runId);
+      }
     }
     const run = await SdkAgentClass.getRun(runId, {
       runtime: "cloud",
@@ -267,9 +291,9 @@ export class CursorClient {
     run: SdkRun,
     maxMs = SDK_RUN_WAIT_MAX_MS,
   ): Promise<SdkRun> {
-    if (!isSdkRunRunning(run.status)) return run;
+    if (!isSdkRunRunning(run.status) && !isStaleTerminalRun(run)) return run;
 
-    if (runSupports(run, "wait") && maxMs > 0) {
+    if (runSupports(run, "wait") && isSdkRunRunning(run.status) && maxMs > 0) {
       try {
         await Promise.race([
           run.wait(),
@@ -277,9 +301,11 @@ export class CursorClient {
             setTimeout(() => reject(new Error("sdk_run_wait_timeout")), maxMs),
           ),
         ]);
-        this.runHandles.delete(runId);
+        this.invalidateRunCache(runId);
         const refreshed = await this.fetchRun(agentId, runId);
-        if (!isSdkRunRunning(refreshed.status)) return refreshed;
+        if (!isSdkRunRunning(refreshed.status) && !isStaleTerminalRun(refreshed)) {
+          return refreshed;
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg !== "sdk_run_wait_timeout") {
@@ -292,9 +318,11 @@ export class CursorClient {
 
     const started = Date.now();
     while (Date.now() - started < maxMs) {
-      this.runHandles.delete(runId);
+      this.invalidateRunCache(runId);
       const refreshed = await this.fetchRun(agentId, runId);
-      if (!isSdkRunRunning(refreshed.status)) return refreshed;
+      if (!isSdkRunRunning(refreshed.status) && !isStaleTerminalRun(refreshed)) {
+        return refreshed;
+      }
       await new Promise((r) => setTimeout(r, SDK_RUN_POLL_MS));
     }
     return await this.fetchRun(agentId, runId);
@@ -498,7 +526,10 @@ export class CursorClient {
   ): Promise<RunTerminalSnapshot> {
     try {
       let run = await this.fetchRun(agentId, runId);
-      if (opts?.waitIfRunning && isSdkRunRunning(run.status)) {
+      if (
+        opts?.waitIfRunning &&
+        (isSdkRunRunning(run.status) || isStaleTerminalRun(run))
+      ) {
         const maxMs = opts.waitMaxMs ?? SDK_RUN_WAIT_MAX_MS;
         run = await this.waitSdkRunDone(agentId, runId, run, maxMs);
       }
@@ -542,6 +573,46 @@ export class CursorClient {
       last = await this.getRun(agentId, runId);
     }
     return last;
+  }
+
+  /**
+   * Wait until run is ready to stream or resolve (first-create env setup).
+   * Polls through stale terminal handles returned immediately after send().
+   */
+  async waitForRunDeliverable(
+    agentId: string,
+    runId: string,
+    maxMs = 120_000,
+  ): Promise<Run> {
+    const started = Date.now();
+    while (Date.now() - started < maxMs) {
+      this.invalidateRunCache(runId);
+      const run = await this.fetchRun(agentId, runId);
+      const mapped = mapSdkRunStatus(run.status);
+
+      if (mapped === "CREATING") {
+        await new Promise((r) => setTimeout(r, SDK_RUN_POLL_MS));
+        continue;
+      }
+
+      if (isSdkRunRunning(run.status)) {
+        return mapSdkRun(run);
+      }
+
+      if (mapped === "FINISHED" && run.result?.trim()) {
+        return mapSdkRun(run);
+      }
+
+      if (isStaleTerminalRun(run)) {
+        await new Promise((r) => setTimeout(r, SDK_RUN_POLL_MS));
+        continue;
+      }
+
+      return mapSdkRun(run);
+    }
+
+    this.invalidateRunCache(runId);
+    return mapSdkRun(await this.fetchRun(agentId, runId));
   }
 
   /** Token usage on SDK run handle (covers poll / fast-finish paths without stream usage). */
