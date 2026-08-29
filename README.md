@@ -1,79 +1,81 @@
+**English** | [中文](README.zh-CN.md)
+
 # cursor-outpost
 
 **Self-hosted bridge between Telegram and [Cursor Cloud Agents](https://cursor.com).**
 
-在 Telegram（含 Topic 话题）里向 Cursor 云端 Agent 提问、收回复；并与 Cursor **Agents Window** 双向同步（Window 里的对话也会推到 Telegram）。
+Ask Cursor cloud agents from Telegram (including Topics) and get replies in chat. **Agents Window** conversations sync both ways—messages in the Cursor web UI also appear in Telegram.
 
-适合：想用 Telegram 当「移动端 / 群聊入口」操作 Cloud Agent 的开发者。数据与 bot 跑在你自己的机器上；Cursor 侧走官方 Cloud Agents API（`@cursor/sdk`）。
-
----
-
-## 你能做什么
-
-| 场景 | 说明 |
-|------|------|
-| Telegram 发问 | 创建 agent 或追问，气泡里看进度和回复，结束有 Done + 链接 |
-| Agents Window | 在 Cursor 网页里聊的内容，会同步到对应 Telegram Topic |
-| 多 Topic | 一个群多个 Topic 可绑定不同仓库，互不干扰 |
-| 会话 | `/resume` 切历史 agent，`/new` 开新映射 |
+For developers who want Telegram as a mobile or group-chat front-end for Cloud Agents. The bot runs on your machine; Cursor traffic uses the official Cloud Agents API (`@cursor/sdk`).
 
 ---
 
-## 使用前准备
+## What you can do
 
-1. **Cursor 账号** + Cloud Agents 可用  
-2. **Cursor API Key**：Cursor 设置里创建（需有 Cloud Agents 权限）  
-3. **Telegram Bot**：通过 [@BotFather](https://t.me/BotFather) 创建，拿到 `TELEGRAM_BOT_TOKEN`  
-4. **你的 Telegram 用户 ID**：例如用 [@userinfobot](https://t.me/userinfobot) 查看（纯数字）  
+| Scenario | Description |
+|----------|-------------|
+| Telegram prompts | Create agents or send follow-ups; see progress and body in a bubble, then Done + link |
+| Agents Window | Chats in the Cursor web UI sync to the bound Telegram Topic |
+| Multiple Topics | One supergroup, many Topics—each can bind a different repo |
+| Sessions | `/resume` to switch agents, `/new` for a fresh local mapping |
+
+---
+
+## Before you start
+
+1. **Cursor account** with Cloud Agents enabled  
+2. **Cursor API Key** from Cursor settings (Cloud Agents access)  
+3. **Telegram Bot** via [@BotFather](https://t.me/BotFather) → `TELEGRAM_BOT_TOKEN`  
+4. **Your Telegram user ID** (e.g. [@userinfobot](https://t.me/userinfobot))  
 5. **Node.js ≥ 22.13**
 
-可选：一个 Telegram **超级群 + Topic**，方便按仓库分话题（私聊也能用）。
+Optional: a Telegram **supergroup with Topics** to separate repos (private chat works too).
 
 ---
 
-## 安装与启动
+## Install and run
 
-### 1. 克隆并安装
+### 1. Clone and install
 
 ```bash
-git clone <本仓库 URL>
+git clone https://github.com/gaojuzhang/cursor-outpost.git
 cd cursor-outpost
 npm install
 ```
 
-### 2. 配置目录（默认 `~/.config/cursor-outpost/`）
+### 2. Config directory (default `~/.config/cursor-outpost/`)
 
 ```bash
 mkdir -p ~/.config/cursor-outpost
 cp config.example.yaml ~/.config/cursor-outpost/config.yaml
 ```
 
-### 3. 环境变量
+### 3. Environment variables
 
-创建 `~/.config/cursor-outpost/.env`：
+Create `~/.config/cursor-outpost/.env`:
 
 ```env
-CURSOR_API_KEY=你的_Cursor_API_Key
-TELEGRAM_BOT_TOKEN=你的_Bot_Token
+CURSOR_API_KEY=your_cursor_api_key
+TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_ALLOW_USER_IDS=123456789
 ```
 
-| 变量 | 说明 |
-|------|------|
-| `CURSOR_API_KEY` | Cursor API 密钥 |
-| `TELEGRAM_BOT_TOKEN` | BotFather 给的 token |
-| `TELEGRAM_ALLOW_USER_IDS` | 允许使用的 Telegram 用户 ID，**逗号分隔**（不在列表里的人消息会被忽略） |
+| Variable | Description |
+|----------|-------------|
+| `CURSOR_API_KEY` | Cursor API key |
+| `TELEGRAM_BOT_TOKEN` | Token from BotFather |
+| `TELEGRAM_ALLOW_USER_IDS` | Allowed Telegram user IDs, **comma-separated** (others are ignored) |
 
-### 4. 运行
+### 4. Start
 
 ```bash
 npm run build
 npm start
 ```
 
-终端出现 `outpost: Cursor API probe ok` 和 poller 启动日志即表示正常。
+You should see `outpost: Cursor API probe ok` and poller startup logs.
 
-开发调试：
+Development:
 
 ```bash
 npm run dev
@@ -81,133 +83,133 @@ npm run dev
 
 ---
 
-## 安全与密钥
+## Security and secrets
 
-**不要把真实密钥提交到 Git。**
+**Never commit real keys to Git.**
 
-| 文件 | 是否进仓库 | 说明 |
-|------|------------|------|
-| `.env.example` | ✅ 仅模板（空值） | 复制到 `~/.config/cursor-outpost/.env` 后填写 |
-| `config.example.yaml` | ✅ 示例 | 复制到 `~/.config/cursor-outpost/config.yaml` |
-| `.env`、`config.yaml`、`*.db` | ❌ 已 `.gitignore` | 含密钥或本地状态 |
+| File | In repo? | Notes |
+|------|----------|-------|
+| `.env.example` | ✅ template only | Copy to `~/.config/cursor-outpost/.env` |
+| `config.example.yaml` | ✅ example | Copy to `~/.config/cursor-outpost/config.yaml` |
+| `.env`, `config.yaml`, `*.db` | ❌ gitignored | Secrets or local state |
 
-密钥只放在本机 `~/.config/cursor-outpost/.env`，不要放在项目目录里。详见 [SECURITY.md](SECURITY.md)。
-
----
-
-## 第一次怎么用
-
-### 方式 A：群 + Topic（推荐）
-
-1. 建超级群，开启 **Topics**，把 bot 拉进群  
-2. 在某个 Topic 里发 `/repos`，看 Cursor 已连接的 GitHub 仓库列表  
-3. 记下要用的 **slug**（列表里每行前面的短名）  
-4. 在同一 Topic 发：`/bind <slug>`（例如 `/bind flux`）  
-5. 直接发文字提问，例如：`当前项目有哪些分支？`  
-6. 等气泡从 Working → 正文 → **Done** + agent 链接  
-
-每个 Topic 单独绑定一个仓库；换 Topic 要重新 `/bind`。
-
-### 方式 B：私聊 bot
-
-1. 在 `config.yaml` 的 `projects` 里配置至少一个仓库，并设 `default: true`（见 `config.example.yaml`）  
-2. 私聊 bot 直接发问题（无需 `/bind`）  
-
-Topic 绑定优先于配置文件；私聊不走 `/bind`。
-
-### 和 Agents Window 一起用
-
-- 在 Cursor Agents Window 里对**同一个 agent** 发问 → Poller 会把用户消息和 agent 回复推到已绑定的 Telegram Topic  
-- 在 Telegram 发的消息**不会**再原样推回 Telegram（回声已过滤）  
+Keep secrets only in `~/.config/cursor-outpost/.env`, not in the project tree. See [SECURITY.md](SECURITY.md) ([中文](SECURITY.zh-CN.md)).
 
 ---
 
-## 常用命令
+## First-time usage
 
-在 Telegram 输入（支持中英文菜单，取决于客户端语言）：
+### Option A: Supergroup + Topics (recommended)
 
-| 命令 | 作用 |
-|------|------|
-| `/repos` | 列出 Cursor 连接的 GitHub 仓库 |
-| `/bind <slug>` | 把**当前 Topic** 绑定到某仓库（先 `/repos` 看 slug） |
-| `/status` | 当前绑定、agent、模型、队列 |
-| `/new` | 清除本 Topic 的 agent 映射（**不**归档云端 agent） |
-| `/resume` | 列出 / 切换可恢复的 Cloud Agent |
-| `/model` | 查看或设置模型，如 `/model auto`、`/model <id>` |
-| `/cancel` | 取消当前 run，清空排队消息 |
-| `/verbose on` / `off` | 是否显示 thinking、tool、上下文用量等详情 |
-| `/ping` | 测 bot 是否在线 |
+1. Create a supergroup, enable **Topics**, add the bot  
+2. In a Topic, send `/repos` to list Cursor-connected GitHub repos  
+3. Note the **slug** for the repo you want  
+4. In the same Topic: `/bind <slug>` (e.g. `/bind flux`)  
+5. Send a message, e.g. `What branches exist in this repo?`  
+6. Wait for Working → body → **Done** + agent link  
 
-**非命令的普通文字** = 向当前 Topic 绑定的 agent 发问或追问。
+Each Topic binds one repo; switch Topic → bind again.
 
----
+### Option B: Private chat with the bot
 
-## 配置（`config.yaml`）
+1. Set at least one repo in `config.yaml` `projects` with `default: true` (see `config.example.yaml`)  
+2. Message the bot directly (no `/bind` needed)  
 
-| 配置项 | 含义 |
-|--------|------|
-| `projects` | 私聊默认仓库；群 Topic 以 `/bind` 为准 |
-| `telegram.verbose` | 全局默认是否详细模式（可被 `/verbose` 覆盖） |
-| `poller.interval_ms` | Window → Telegram 轮询间隔（默认 8s） |
-| `agent_catalog.interval_ms` | `/resume` 列表缓存刷新 |
-| `repo_catalog.interval_ms` | `/repos` 列表缓存刷新 |
+Topic `/bind` overrides config; private chat does not use `/bind`.
 
-完整示例见仓库根目录 `config.example.yaml`。
+### With Agents Window
 
-本地状态 SQLite：`~/.config/cursor-outpost/state.db`（Topic 绑定、run 去重等）。
+- Prompt the **same agent** in Cursor Agents Window → poller pushes user messages and replies to the bound Telegram Topic  
+- Telegram-originated messages are **not** echoed back (filtered)  
 
 ---
 
-## 回复展示说明
+## Commands
 
-- Agent 回复支持常见 **Markdown**（粗体、行内代码、代码块、链接）  
-- Telegram **不支持表格**，表格会以等宽块展示  
-- 结束时消息底部为 **Done** + Cursor agent 链接（及 PR 链接若有）  
+Telegram slash menu is English or Chinese depending on client language.
 
----
+| Command | Description |
+|---------|-------------|
+| `/repos` | List Cursor-connected GitHub repos |
+| `/bind <slug>` | Bind **this Topic** to a repo (use `/repos` for slug) |
+| `/status` | Binding, agent, model, queue |
+| `/new` | Clear local agent mapping (**does not** archive cloud agent) |
+| `/resume` | List or switch recoverable Cloud Agents |
+| `/model` | View/set model, e.g. `/model auto`, `/model <id>` |
+| `/cancel` | Cancel current run and clear queue |
+| `/verbose on` / `off` | Show thinking, tools, context usage |
+| `/ping` | Connectivity check |
 
-## 常见问题
-
-**启动报错 `Missing CURSOR_API_KEY`**  
-检查 `.env` 路径与变量名，或导出环境变量后重试。
-
-**发消息没反应**  
-确认你的 Telegram ID 在 `TELEGRAM_ALLOW_USER_IDS` 里；看终端是否有 `ignore non-allowlist`。
-
-**群 Topic 里提示要先 bind**  
-在该 Topic 执行 `/repos` → `/bind <slug>`。
-
-**一直显示 Working、不出正文**  
-重启 outpost（`npm run build && npm start`）；看日志是否有 `run delivered`。快问类问题会走 conversation 回退拿正文。
-
-**Done 下面没有文字**  
-多为 API 未返回 `result`；会显示占位提示，点 agent 链接在 Cursor 里查看。
-
-**Window 里已经答完，Telegram 还在等**  
-同上，确保版本最新；SDK stream 超时后会自动走解析回退。
+Plain text (not a command) = prompt or follow-up to the bound agent.
 
 ---
 
-## 架构（给想改代码的人）
+## Configuration (`config.yaml`)
 
-Telegram 发问主路径：
+| Key | Meaning |
+|-----|---------|
+| `projects` | Default repo for private chat; group Topics use `/bind` |
+| `telegram.verbose` | Default verbose mode (overridable per Topic) |
+| `poller.interval_ms` | Window → Telegram poll interval (default 8s) |
+| `agent_catalog.interval_ms` | `/resume` list cache refresh |
+| `repo_catalog.interval_ms` | `/repos` list cache refresh |
+
+See `config.example.yaml` in the repo root.
+
+Local SQLite state: `~/.config/cursor-outpost/state.db` (bindings, run dedup, etc.).
+
+---
+
+## How replies look
+
+- Common **Markdown** is rendered as HTML (bold, code, links)  
+- Telegram has **no tables**—tables appear as monospace blocks  
+- Footer: **Done** + Cursor agent URL (and PR URLs when present)  
+
+---
+
+## FAQ
+
+**`Missing CURSOR_API_KEY` on start**  
+Check `.env` path and variable names, or export env vars before starting.
+
+**No response to messages**  
+Ensure your Telegram ID is in `TELEGRAM_ALLOW_USER_IDS`; check logs for `ignore non-allowlist`.
+
+**Topic asks to bind first**  
+Run `/repos` then `/bind <slug>` in that Topic.
+
+**Stuck on Working, no body**  
+Restart outpost (`npm run build && npm start`); look for `run delivered` in logs. Short prompts use conversation fallback for body text.
+
+**Done with no body text**  
+API may omit `result`; a placeholder is shown—open the agent link in Cursor.
+
+**Answer in Window but Telegram still waiting**  
+Use the latest build; stream timeouts fall back to resolver + conversation.
+
+---
+
+## Architecture (for contributors)
+
+Telegram prompt path:
 
 ```
 Router → RunSession → RunBodyResolver → TelegramRunPresenter → Telegram
 ```
 
-- `src/core/router.ts` — 命令与发问入口  
-- `src/delivery/` — 单次 run 的观测、正文解析、展示  
+- `src/core/router.ts` — commands and delivery entry  
+- `src/delivery/` — run observation, body resolution, presentation  
 - `src/sync/poller.ts` — Agents Window → Telegram  
-- `src/cursor/client.ts` — `@cursor/sdk` 封装  
+- `src/cursor/client.ts` — `@cursor/sdk` wrapper  
 
 ---
 
-## 开发
+## Development
 
 ```bash
-npm run build   # 编译到 dist/
-npm run dev     # tsx 直接运行 src/
+npm run build   # compile to dist/
+npm run dev     # run src/ with tsx
 ```
 
 ## License
